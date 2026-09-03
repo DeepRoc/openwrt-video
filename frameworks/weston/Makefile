@@ -25,8 +25,7 @@ define Package/weston
   SUBMENU:=Frameworks and Toolkits
   TITLE:=weston
   URL:=https://wayland.freedesktop.org/
-  DEPENDS:=+gstreamer1-plugins-base +libcairo +libevdev +libdisplay-info \
-	+libgst1allocators +libgst1app +libgst1video +libgstreamer1 +libinput \
+  DEPENDS:=+libcairo +libevdev +libdisplay-info +libinput \
 	+libmesa +libpango +libseat +libwayland +libwebp +libxkbcommon +pixman \
 	+seatd +vulkan-loader +wayland-protocols +xkeyboard-config
 endef

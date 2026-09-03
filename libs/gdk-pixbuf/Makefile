@@ -14,11 +14,20 @@ PKG_LICENSE_FILES:=COPYING
 PKG_CPE_ID:=cpe:/a:gnome:gdk-pixbuf
 
 PKG_BUILD_DEPENDS:=glib2/host
+HOST_BUILD_DEPENDS:=shared-mime-info/host
 
 include $(INCLUDE_DIR)/package.mk
+include $(INCLUDE_DIR)/host-build.mk
 include $(INCLUDE_DIR)/meson.mk
 
 MESON_ARGS += \
+	-Ddocumentation=false \
+	-Dglycin=disabled \
+	-Dinstalled_tests=false \
+	-Dman=false \
+	-Dtests=false
+
+MESON_HOST_ARGS += \
 	-Ddocumentation=false \
 	-Dglycin=disabled \
 	-Dinstalled_tests=false \
@@ -64,3 +73,4 @@ define Package/libgdk-pixbuf/install
 endef
 
 $(eval $(call BuildPackage,libgdk-pixbuf))
+$(eval $(call HostBuild))

@@ -55,8 +55,8 @@ CMAKE_OPTIONS += \
 	-DSDL_PIPEWIRE=OFF \
 	-DSDL_PTHREADS=ON \
 	-DSDL_PTHREADS_SEM=ON \
-	-DSDL_PULSEAUDIO=ON \
-	-DSDL_PULSEAUDIO_SHARED=ON \
+	-DSDL_PULSEAUDIO=OFF \
+	-DSDL_PULSEAUDIO_SHARED=OFF \
 	-DSDL_RPATH=OFF \
 	-DSDL_RPI=OFF \
 	-DSDL_SNDIO=OFF \
@@ -76,7 +76,7 @@ define Package/libsdl3
   CATEGORY:=Libraries
   TITLE:=Simple DirectMedia Layer 3
   URL:=https://www.libsdl.org
-  DEPENDS:=+libstdcpp +alsa-lib +libusb-1.0 +libudev-zero +pulseaudio +libmesa
+  DEPENDS:=+libstdcpp +alsa-lib +libusb-1.0 +libudev-zero +libmesa
 endef
 
 define Package/libsdl3/description
