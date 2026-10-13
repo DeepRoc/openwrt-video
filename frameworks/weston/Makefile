@@ -25,7 +25,7 @@ define Package/weston
   SUBMENU:=Frameworks and Toolkits
   TITLE:=weston
   URL:=https://wayland.freedesktop.org/
-  DEPENDS:=+libcairo +libevdev +libdisplay-info +libinput \
+  DEPENDS:=+libcairo +libevdev +libinput \
 	+libmesa +libpango +libseat +libwayland +libwebp +libxkbcommon +pixman \
 	+seatd +vulkan-loader +wayland-protocols +xkeyboard-config
 endef
