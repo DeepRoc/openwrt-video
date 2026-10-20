@@ -1,0 +1,3258 @@
+Subject: [PATCH] rocket: extend integer and FP16 operation execution
+
+--- a/src/gallium/drivers/rocket/meson.build
++++ b/src/gallium/drivers/rocket/meson.build
+@@ -15,6 +15,7 @@
+   'rkt_ml.c',
+   'rkt_regcmd.c',
+   'rkt_task.c',
++  'rkt_float_ops.c',
+ )
+ 
+ librocket = static_library(
+--- a/src/gallium/drivers/rocket/rkt_coefs.c
++++ b/src/gallium/drivers/rocket/rkt_coefs.c
+@@ -7,6 +7,7 @@
+ 
+ #include "rkt_coefs.h"
+ #include "rkt_ml.h"
++#include <errno.h>
+ 
+ struct pipe_resource *
+ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
+@@ -21,13 +22,14 @@
+    unsigned output_channels_real = poperation->output_tensors[0]->dims[3];
+    unsigned weights_size;
+    uint8_t zero_point = poperation->conv.weight_tensor->zero_point;
++   unsigned signed_shift = poperation->conv.weight_tensor->is_signed ? 0 : 0x80;
+    struct pipe_transfer *transfer_out;
+    void *map = poperation->conv.weight_tensor->data;
+    uint8_t(*weights_in)[weights_width][weights_height][input_channels] = map;
+    struct pipe_resource *rsc;
+    uint8_t *weights_out;
+ 
+-   input_channels =
++   input_channels = rkt_is_depthwise(poperation) ? align(input_channels, 64) :
+       align(MAX2(input_channels, FEATURE_ATOMIC_SIZE), FEATURE_ATOMIC_SIZE);
+ 
+    output_channels = align(output_channels, 2);
+@@ -39,8 +41,10 @@
+ 
+    rsc =
+       pipe_buffer_create(pcontext->screen, 0, PIPE_USAGE_DEFAULT, weights_size);
++   if (!rsc) { rkt_context(pcontext)->error = ENOMEM; return NULL; }
+    weights_out = pipe_buffer_map(pcontext, rsc, PIPE_MAP_WRITE, &transfer_out);
+ 
++   if (!weights_out) { pipe_resource_reference(&rsc,NULL); return NULL; }
+    unsigned input_channel_groups = WEIGHT_ATOMIC_SIZE;
+    if (rkt_is_depthwise(poperation))
+       input_channel_groups *= 2;
+@@ -67,14 +71,12 @@
+                      if (oc >= output_channels_real)
+                         weights_out[n++] = 0x0;
+                      else if (ic >= input_channels_real) {
+-                        if (ic2 < 16 || (input_channels_real % 32) > 16)
++                        if (rkt_is_depthwise(poperation) || ic2 < 16 ||
++                            (input_channels_real % 32) > 16)
+                            weights_out[n++] =
+-                              zero_point - 0x80; /* TODO: Why is the blob converting to
+-                                                    signed? It should be unsigned. */
++                              zero_point - signed_shift;
+                      } else
+-                        weights_out[n++] = weights_in[oc][x][y][ic] -
+-                                           0x80; /* TODO: Why is the blob converting to
+-                                                    signed? It should be unsigned. */
++                        weights_out[n++] = weights_in[oc][x][y][ic] - signed_shift;
+                   }
+                }
+             }
+@@ -98,26 +100,30 @@
+                           unsigned oc, void *map)
+ {
+    unsigned input_channels = poperation->input_tensors[0]->dims[3];
+-   unsigned input_zero_point = poperation->input_tensors[0]->zero_point;
++   int32_t input_zero_point = poperation->input_tensors[0]->zero_point -
++                             (poperation->input_tensors[0]->is_signed ? 0 : 128);
+    unsigned weights_width = poperation->conv.weight_tensor->dims[1];
+    unsigned weights_height = poperation->conv.weight_tensor->dims[2];
+-   unsigned weight_zero_point = poperation->conv.weight_tensor->zero_point;
++   int32_t weight_zero_point = poperation->conv.weight_tensor->zero_point;
++   bool weights_signed = poperation->conv.weight_tensor->is_signed;
+    uint8_t(*weights)[weights_width][weights_height][input_channels] = map;
+ 
+    int32_t correction = 0;
+    if (rkt_is_depthwise(poperation)) {
+       for (unsigned x = 0; x < weights_width; x++) {
+          for (unsigned y = 0; y < weights_height; y++) {
+-            correction += (weights[0][x][y][oc] - weight_zero_point) *
+-                          (input_zero_point - 0x80);
++            int32_t w = weights_signed ? (int8_t)weights[0][x][y][oc] :
++                                         weights[0][x][y][oc];
++            correction += (w - weight_zero_point) * input_zero_point;
+          }
+       }
+    } else {
+       for (unsigned x = 0; x < weights_width; x++) {
+          for (unsigned y = 0; y < weights_height; y++) {
+             for (unsigned ic = 0; ic < input_channels; ic++) {
+-               correction += (weights[oc][x][y][ic] - weight_zero_point) *
+-                             (input_zero_point - 0x80);
++               int32_t w = weights_signed ? (int8_t)weights[oc][x][y][ic] :
++                                            weights[oc][x][y][ic];
++               correction += (w - weight_zero_point) * input_zero_point;
+             }
+          }
+       }
+@@ -140,9 +146,14 @@
+    struct pipe_resource *rsc;
+    uint32_t *biases;
+ 
++   unsigned bias_channels = rkt_is_depthwise(poperation) ?
++      align(output_channels, 64) : output_channels;
+    rsc = pipe_buffer_create(pcontext->screen, 0, PIPE_USAGE_DEFAULT,
+-                            output_channels * sizeof(uint32_t));
++                            bias_channels * sizeof(uint32_t));
++   if (!rsc) { rkt_context(pcontext)->error = ENOMEM; return NULL; }
+    biases = pipe_buffer_map(pcontext, rsc, PIPE_MAP_WRITE, &transfer_out);
++   if (!biases) { pipe_resource_reference(&rsc,NULL); return NULL; }
++   memset(biases, 0, bias_channels * sizeof(uint32_t));
+ 
+    // DBG("weight_scale %x\n",
+    // fui(poperation->conv.weight_tensor->scale));
+@@ -214,3 +225,180 @@
+ 
+    return rsc;
+ }
++
++/* Per-axis quantization. Register/layout reference (independently tested
++ * on this board before integration): gregordinary/rockchip-npu-notes,
++ * encodings/out-cvt-converter.md, per-axis BS multiplier section. */
++struct pipe_resource *
++rkt_fill_peraxis(struct rkt_ml_subgraph *subgraph,
++                 const struct pipe_ml_operation *pop,
++                 struct rkt_operation *op)
++{
++   struct pipe_context *ctx = subgraph->context;
++   unsigned channels = op->output_channels;
++   unsigned ic = op->input_channels;
++   unsigned area = op->weights_width * op->weights_height;
++   const int8_t *w = (const int8_t *)pop->conv.weight_tensor->data;
++   const int32_t *bias = (const int32_t *)pop->conv.bias_tensor->data;
++   const float *scales = pop->conv.weight_tensor->scales;
++   float max_scale = 0.0f;
++   int64_t max_bound = 0;
++   for (unsigned oc = 0; oc < channels; oc++) {
++      int64_t sum_abs = 0;
++      for (unsigned k = 0; k < area; k++) {
++         if (op->depthwise)
++            sum_abs += abs(w[k * channels + oc]);
++         else
++            for (unsigned c = 0; c < ic; c++)
++               sum_abs += abs(w[(oc * area + k) * ic + c]);
++      }
++      int64_t corr = calculate_bias_correction(subgraph, pop, oc, (void *)w);
++      max_bound = MAX2(max_bound, llabs((int64_t)bias[oc] - corr) + 128 * sum_abs);
++      max_scale = MAX2(max_scale, scales[oc]);
++   }
++   /* Optional, measured INT8 double-rounding route. Both BS and BN have
++    * signed 16-bit multipliers. Approximate TFLite's Q31 multiplier with
++    * 2*C*M, first round in BN, and perform the signed final rounding in
++    * OUT_CVT. Preparation only; no host correction during inference. */
++   unsigned double_c = 0;
++   if (channels == 1 && !op->relu) {
++      double real = (double)op->input_scale * scales[0] / op->output_scale;
++      int exponent;
++      double mantissa = frexp(real, &exponent);
++      int64_t target = llround(ldexp(mantissa, 31));
++      if (target == (1LL << 31)) { target /= 2; exponent++; }
++      if (real > 0 && real < 0.5 && exponent <= -1 && exponent >= -31) {
++         int64_t best = INT64_MAX;
++         for (unsigned c = (target + 65533) / 65534; c <= 32767; c++) {
++            unsigned m = (target + c) / (2 * c);
++            int64_t error = llabs(2 * (int64_t)c * m - target);
++            if (m <= 32767 && error < best) {
++               best = error; double_c = c; op->double_bn_mul = m;
++            }
++         }
++         op->double_out_shift = -exponent;
++      }
++   }
++   /* For multiple channels, normalize each mantissa in BS (Q15). BN reads
++    * dense int16 powers of two with NRDMA DATA_USE=4 and ALU bypassed.
++    * OUT_CVT then uses a common shift with ties away from zero. This matches
++    * CONV2D and scalar DW tails; do not apply it to the NEON DW blocks whose
++    * negative ties round upward. All bounds cover every possible INT8 input. */
++   bool signed_vector = !op->relu &&
++                        channels > 1 && (!op->depthwise || channels < 8);
++   unsigned *vector_c = signed_vector ? calloc(channels, sizeof(*vector_c)) : NULL;
++   unsigned *vector_m = signed_vector ? calloc(channels, sizeof(*vector_m)) : NULL;
++   int *exponents = signed_vector ? calloc(channels, sizeof(*exponents)) : NULL;
++   if (signed_vector && (!vector_c || !vector_m || !exponents)) {
++      free(vector_c); free(vector_m); free(exponents);
++      rkt_context(ctx)->error=ENOMEM; return NULL;
++   }
++   signed_vector = signed_vector && vector_c && vector_m && exponents;
++   int min_exp = 0;
++   for (unsigned oc = 0; signed_vector && oc < channels; oc++) {
++      double real = (double)op->input_scale * scales[oc] / op->output_scale;
++      double mantissa = frexp(real, &exponents[oc]);
++      vector_c[oc] = lround(ldexp(mantissa, 15));
++      signed_vector = real > 0 && real < 0.5 && exponents[oc] >= -31 &&
++                      vector_c[oc] > 0 && vector_c[oc] <= 32767;
++      min_exp = MIN2(min_exp, exponents[oc]);
++   }
++   for (unsigned oc = 0; signed_vector && oc < channels; oc++) {
++      int distance = exponents[oc] - min_exp;
++      signed_vector = distance >= 0 && distance < 15;
++      if (signed_vector) {
++         vector_m[oc] = 1u << distance;
++         signed_vector = max_bound * vector_m[oc] <= INT32_MAX;
++      }
++   }
++   if (signed_vector) {
++      op->double_bn_mul = 1;
++      op->double_bn_shift = 0;
++      op->double_out_shift = -min_exp;
++   }
++   /* BN adds at most 32768 in the compensated path. Reserve its headroom
++    * in the same worst-case accumulator bound used for BS. */
++   bool rounding = op->relu;
++
++   op->bs_shift = 0;
++   while ((max_bound * 32767 >> op->bs_shift) >
++          INT32_MAX - (rounding ? 32768 : 0))
++      op->bs_shift++;
++   if (double_c) {
++      op->bs_shift = 0;
++      while ((max_bound * double_c >> op->bs_shift) > INT32_MAX)
++         op->bs_shift++;
++      op->double_bn_shift = 30 - op->bs_shift;
++   }
++   if (signed_vector) op->bs_shift = 15;
++   op->weights_scale = ldexpf(max_scale / 32767.0f, op->bs_shift);
++   op->truncate_bits = 0;
++   unsigned bytes = align(channels, op->depthwise ? 64 : 32) / 8 * 64;
++   float common = (op->input_scale * op->weights_scale) / op->output_scale;
++   uint32_t bits = fui(common);
++   int shift = 141 - (bits >> 23);
++   unsigned m = ((bits >> 9) & 0x7fff) + 1;
++   if (m < (1u << 14)) m |= 1u << 14;
++   /* Keep the existing route outside the verified integer-converter range. */
++   rounding = rounding && isfinite(common) && common > 0.0f &&
++              shift >= 0 && shift <= 63 && m <= INT16_MAX;
++   for (unsigned oc = 0; rounding && oc < channels; oc++) {
++      double scale = (double)op->input_scale * scales[oc] / op->output_scale;
++      double c = scale * ldexp(1.0, op->bs_shift + shift) / m;
++      rounding = isfinite(scale) && scale > 0.0 && scale < 0.5 &&
++                 c >= 0.0 && c < 32767.5;
++   }
++   op->rounding_offset = rounding ? bytes : 0;
++   if (rounding)
++      bytes += align(channels, op->depthwise ? 64 : 32) * 4;
++   if (signed_vector) {
++      op->bn_vector_offset = bytes;
++      bytes += align(channels, 64) * 2;
++   }
++   struct pipe_resource *res = pipe_buffer_create(ctx->screen, 0, PIPE_USAGE_DEFAULT, bytes);
++   struct pipe_transfer *transfer;
++   if (!res) { free(vector_c); free(vector_m); free(exponents); rkt_context(ctx)->error=ENOMEM; return NULL; }
++   uint8_t *map = pipe_buffer_map(ctx, res, PIPE_MAP_WRITE, &transfer);
++   if (!map) { free(vector_c); free(vector_m); free(exponents); pipe_resource_reference(&res,NULL); return NULL; }
++   memset(map, 0, bytes);
++   for (unsigned oc = 0; oc < channels; oc++) {
++      unsigned base = (oc / 8) * 64;
++      int32_t a = bias[oc] - calculate_bias_correction(subgraph, pop, oc, (void *)w);
++      if (op->bn_vector_offset) {
++         int16_t multiplier = signed_vector ? vector_m[oc] : op->double_bn_mul;
++         memcpy(map + op->bn_vector_offset + oc * 2, &multiplier, 2);
++      }
++      int16_t c = (int16_t)lroundf(scales[oc] / max_scale * 32767.0f);
++      if (double_c) c = double_c;
++      if (signed_vector) c = vector_c[oc];
++      memcpy(map + base + (oc % 8) * 4, &a, 4);
++      memcpy(map + base + 48 + (oc % 8) * 2, &c, 2);
++      if (rounding) {
++         double channel_scale = (double)op->input_scale * scales[oc] / op->output_scale;
++         /* Derive the channel coefficient from the actual emitted common gain,
++          * avoiding two independent approximations of the same scale. */
++         c = lround(channel_scale * ldexp(1.0, op->bs_shift + shift) / m);
++         memcpy(map + base + 48 + (oc % 8) * 2, &c, 2);
++         int exponent;
++         frexp(channel_scale, &exponent);
++         double half_step = exponent < 0 ? ldexp(1.0, exponent - 1) : 0.0;
++         int32_t delta = lround(half_step * ldexp(1.0, shift) / m);
++         /* For nonnegative accumulators, two rounds with final right shift r
++          * equal a single round after adding 2^(-r-1) in output units (apart
++          * from exact ties). BN adds that constant in BS-output units. ReLU
++          * makes the negative branch irrelevant; do not apply this to signed
++          * outputs without ReLU, whose TFLite rounding depends on the kernel.
++          * No weights or model biases are changed. */
++         memcpy(map + op->rounding_offset + oc * 4, &delta, 4);
++      }
++   }
++   if (signed_vector) DBG("SIGNED_DOUBLE output=%u channels=%u bs=%u out=%u\n", op->output_index, channels, op->bs_shift, op->double_out_shift);
++   free(vector_c); free(vector_m); free(exponents);
++   if (double_c) DBG("DOUBLE output=%u C=%u M=%u bs=%u bn=%u out=%u\n", op->output_index, double_c, op->double_bn_mul, op->bs_shift, op->double_bn_shift, op->double_out_shift);
++   if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
++      rkt_dump_buffer(map, "peraxis", op->output_index, 0, 0, bytes);
++   pipe_buffer_unmap(ctx, transfer);
++   DBG("PERAXIS output=%u channels=%u shift=%u max_bound=%lld max_scale=%.9g\n",
++           op->output_index, channels, op->bs_shift, (long long)max_bound, max_scale);
++   return res;
++}
+--- a/src/gallium/drivers/rocket/rkt_coefs.h
++++ b/src/gallium/drivers/rocket/rkt_coefs.h
+@@ -9,6 +9,11 @@
+ #include "rkt_ml.h"
+ 
+ struct pipe_resource *
++rkt_fill_peraxis(struct rkt_ml_subgraph *subgraph,
++                 const struct pipe_ml_operation *poperation,
++                 struct rkt_operation *operation);
++
++struct pipe_resource *
+ rkt_fill_weights(struct rkt_ml_subgraph *subgraph,
+                  const struct pipe_ml_operation *poperation);
+ 
+--- /dev/null
++++ b/src/gallium/drivers/rocket/rkt_float_domain.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef RKT_FLOAT_DOMAIN_H
++#define RKT_FLOAT_DOMAIN_H
++#include <stdbool.h>
++#include <stdint.h>
++/* The LUT index is the unsigned encoding of a nonnegative finite FP16 value.
++ * Zero is valid for sqrt, but not for reciprocal or reciprocal sqrt. */
++static inline bool
++rkt_float_lut_input_valid(uint16_t bits, bool allow_zero)
++{
++   return bits < UINT16_C(0x7c00) && (allow_zero || bits != 0);
++}
++#endif
+--- /dev/null
++++ b/src/gallium/drivers/rocket/rkt_float_ops.c
+@@ -0,0 +1,907 @@
++/* SPDX-License-Identifier: MIT
++ * FP16 convolution support with per-operation packed buffers. Host work is packing, padding,
++ * FP16 conversion and output reordering; CNA/CORE/DPU perform all arithmetic.
++ */
++#include "pipe/p_state.h"
++#include <errno.h>
++#include "rkt_float_domain.h"
++#include <math.h>
++#include <arm_neon.h>
++#include "util/u_inlines.h"
++#include "rkt_ml.h"
++#include "rkt_registers.h"
++#include "rkt_float_ops.h"
++#include "rkt_float_tile_registers.h"
++
++/* A pointwise convolution still issues at least four rows/columns. A shared
++ * C8 surface must reserve those rows even when the logical tensor is 1xW.
++ * Existing >=4 spatial surfaces keep exactly their previous strides. */
++#define RKT_FLOAT_MAX_VECTOR_WIDTH 97u
++#define RKT_FLOAT_MAX_VECTOR_CHANNELS 544u
++#define RKT_FLOAT_MAX_INPUT_CHANNELS 2304u
++
++static unsigned fp16_extent(unsigned n, bool global)
++{
++   return global ? MAX2(n, 4) + 2 : n;
++}
++static bool fp16_small(unsigned h, unsigned w)
++{
++   return h == 1 && w <= RKT_FLOAT_MAX_VECTOR_WIDTH;
++}
++
++/* Shape limits below bound the implemented tiling/layout paths. They are
++ * conservative validated limits, not advertised hardware maxima. CBUF bank
++ * calculations additionally enforce the physical twelve-bank capacity.
++ * Expand these limits only with boundary/layout tests and numerical validation. */
++static bool fp32(const struct pipe_tensor *t)
++{
++   return t && t->is_float && t->type_size == 4;
++}
++
++static size_t cube(unsigned h, unsigned w, unsigned c, unsigned y,
++                   unsigned x, unsigned atom)
++{
++   return (((size_t)(c / atom) * h + y) * w + x) * atom + c % atom;
++}
++
++/* Choose a tile that fits both input and weights in the physical CBUF.
++ * Depthwise consumes and produces the same channel vector: keep that vector
++ * together rather than reusing the dense output-channel slicing convention. */
++static bool
++float_conv_tile(const struct pipe_ml_operation *p, unsigned *rows_out,
++                unsigned *channels_out)
++{
++   unsigned ic = align(p->input_tensors[0]->dims[3], 32);
++   unsigned oc = align(p->output_tensors[0]->dims[3], 16);
++   unsigned kh = p->conv.weight_tensor->dims[1];
++   unsigned oh = p->output_tensors[0]->dims[1];
++   unsigned ow = p->output_tensors[0]->dims[2];
++   unsigned stride = p->conv.stride_y;
++   bool dw = p->conv.depthwise;
++   bool global = p->input_tensors[0]->dims[1] >= 4 &&
++                 p->input_tensors[0]->dims[2] >= 4 && oh >= 4 && ow >= 4;
++   unsigned channels = dw ? ic : (kh == 3 && ic > 128 ? 64 : 128);
++   for (; channels >= 16; channels /= 2) {
++      unsigned weights = kh * kh * ic * (dw ? 1 : MIN2(channels, oc)) * 2;
++      for (unsigned rows = 32; rows >= 4; rows /= 2) {
++         unsigned ih = (MAX2(4, MIN2(rows, oh)) - 1) * stride + kh;
++         unsigned iw = global ? fp16_extent(p->input_tensors[0]->dims[2], true) :
++                       (MAX2(4, MIN2(160, ow)) - 1) * stride + kh;
++         unsigned input = ih * iw * ic * 2;
++         if (DIV_ROUND_UP(input, CBUF_BANK_SIZE) +
++             DIV_ROUND_UP(weights, CBUF_BANK_SIZE) <= CBUF_BANKS) {
++            *rows_out = rows;
++            *channels_out = channels;
++            return true;
++         }
++      }
++      if (dw)
++         break;
++   }
++   return false;
++}
++
++bool
++rkt_float_conv_supported(const struct pipe_ml_operation *p)
++{
++   const struct pipe_tensor *in = p->input_tensors[0];
++   const struct pipe_tensor *out = p->output_tensors[0];
++   const struct pipe_tensor *w = p->conv.weight_tensor;
++   const struct pipe_tensor *b = p->conv.bias_tensor;
++   if (!fp32(in) || !fp32(out) || !fp32(w) || !fp32(b) ||
++       !w->data || !b->data || in->dims[0] != 1 || out->dims[0] != 1)
++      return false;
++   unsigned ic = in->dims[3], oc = out->dims[3], kh = w->dims[1], kw = w->dims[2];
++   unsigned sy = p->conv.stride_y, sx = p->conv.stride_x;
++   unsigned oh = out->dims[1], ow = out->dims[2];
++   bool dw = p->conv.depthwise;
++   if (!ic || ic > RKT_FLOAT_MAX_INPUT_CHANNELS || !oc || oc > 1536 || kh != kw || (kh < 1 || kh > 3) ||
++       sx != sy || (sy != 1 && sy != 2) ||
++       p->conv.dilation_width_factor != 1 || p->conv.dilation_height_factor != 1 ||
++       !oh || oh > 320 || !ow || ow > 320 ||
++       in->dims[1] > 642 || in->dims[2] > 642 ||
++       p->conv.padding_top > 1 || p->conv.padding_bottom > 1 ||
++       p->conv.padding_left > 1 || p->conv.padding_right > 1 ||
++       b->dims[0] != 1 || b->dims[1] != 1 || b->dims[2] != 1 || b->dims[3] != oc ||
++       w->dims[3] != ic || w->dims[0] != (dw ? 1 : oc) ||
++       (dw && (ic != oc || kh != 3)))
++      return false;
++   unsigned padded_h = in->dims[1] + p->conv.padding_top + p->conv.padding_bottom;
++   unsigned padded_w = in->dims[2] + p->conv.padding_left + p->conv.padding_right;
++   if (padded_h < kh || padded_w < kw ||
++       (padded_h - kh) / sy + 1 != oh || (padded_w - kw) / sx + 1 != ow)
++      return false;
++
++   unsigned rows, channels;
++   return float_conv_tile(p, &rows, &channels);
++}
++
++bool
++rkt_lower_float_conv(struct rkt_ml_subgraph *s,
++                    const struct pipe_ml_operation *p, struct rkt_operation *o)
++{
++   const struct pipe_tensor *in = p->input_tensors[0];
++   const struct pipe_tensor *out = p->output_tensors[0];
++   const struct pipe_tensor *w = p->conv.weight_tensor;
++   const struct pipe_tensor *b = p->conv.bias_tensor;
++   if (!rkt_float_conv_supported(p)) return false;
++   unsigned ic = in->dims[3], oc = out->dims[3], kh = w->dims[1], kw = w->dims[2];
++   unsigned sy = p->conv.stride_y, sx = p->conv.stride_x;
++   unsigned oh = out->dims[1], ow = out->dims[2];
++   bool dw = p->conv.depthwise;
++   unsigned tile_rows, channels_per_task;
++   if (!float_conv_tile(p, &tile_rows, &channels_per_task))
++      return false;
++   o->float_conv_f16 = true;
++   o->depthwise = dw;
++   o->conv_output_f16 = true;
++   o->conv_relu = p->conv.relu;
++   o->conv_physical_ic = align(ic, 32);
++   o->conv_physical_oc = dw ? o->conv_physical_ic : align(oc, 16);
++   o->conv_tiles_y = DIV_ROUND_UP(oh, tile_rows);
++   o->conv_tiles_x = DIV_ROUND_UP(ow, 160);
++   o->input_index = in->index; o->output_index = out->index;
++   o->input_height = in->dims[1]; o->input_width = in->dims[2]; o->input_channels = ic;
++   o->output_height = oh; o->output_width = ow; o->output_channels = oc;
++   o->weights_height = kh; o->weights_width = kw; o->stride = sy;
++   o->padding_top = p->conv.padding_top; o->padding_left = p->conv.padding_left;
++   o->tasks = UTIL_DYNARRAY_INIT;
++   unsigned weight_bytes = kh * kw * o->conv_physical_ic * (dw ? 1 : o->conv_physical_oc) * 2;
++   for (unsigned channel = 0; channel < o->conv_physical_oc; channel += channels_per_task) {
++   for (unsigned y = 0; y < oh; y += tile_rows) {
++      for (unsigned x = 0; x < ow; x += 160) {
++         struct split_task t = {0};
++         t.num = util_dynarray_num_elements(&o->tasks, struct split_task);
++         /* The hardware tile is at least 4x4. Overlap the final tile instead
++          * of writing beyond a global surface when its tail is 1..3 pixels. */
++         t.conv_y = MIN2(y, oh > 4 ? oh - 4 : 0);
++         t.conv_x = MIN2(x, ow > 4 ? ow - 4 : 0);
++         t.conv_c = channel;
++         t.output_channels = MIN2(channels_per_task, o->conv_physical_oc-channel);
++         t.output_height = MAX2(4, MIN2(tile_rows, oh - t.conv_y)); t.output_width = MAX2(4, MIN2(160, ow - t.conv_x));
++         t.input_height = (t.output_height - 1) * sy + kh;
++         t.input_width = (t.output_width - 1) * sx + kw;
++         t.conv_input_bytes = t.input_height * t.input_width * o->conv_physical_ic * 2;
++         t.conv_output_bytes = t.output_height * t.output_width * t.output_channels * (o->conv_output_f16 ? 2 : 4);
++         t.input_banks = DIV_ROUND_UP(t.conv_input_bytes, CBUF_BANK_SIZE);
++         unsigned tile_weight_bytes=kh*kw*o->conv_physical_ic*(dw ? 1 : t.output_channels)*2;
++         if (t.input_height < 4 || t.input_banks + DIV_ROUND_UP(tile_weight_bytes, CBUF_BANK_SIZE) > CBUF_BANKS)
++            goto fail;
++         t.weights_banks = CBUF_BANKS - t.input_banks;
++         t.input_offset = o->conv_input_bytes; t.output_offset = o->conv_output_bytes;
++         o->conv_input_bytes += align(t.conv_input_bytes + FLOAT_GUARD, 4096);
++         o->conv_output_bytes += align(t.conv_output_bytes + FLOAT_GUARD, 4096);
++         util_dynarray_append(&o->tasks, t);
++      }
++   }
++
++   }
++
++   /* Global C8 cube with a one-pixel zero border. Tile views read/write it
++    * with explicit line/surface strides; the model's logical shape is unchanged. */
++   o->fp16_global=((in->dims[1]>=4 && in->dims[2]>=4 && oh>=4 && ow>=4) ||
++       (!o->reduce_spatial && kh==1 && kw==1 && sx==1 && sy==1 &&
++        fp16_small(in->dims[1],in->dims[2]) && fp16_small(oh,ow) &&
++        DIV_ROUND_UP(4*fp16_extent(in->dims[2],true)*o->conv_physical_ic*2,CBUF_BANK_SIZE) +
++        DIV_ROUND_UP(o->conv_physical_ic*MIN2(channels_per_task,o->conv_physical_oc)*2,CBUF_BANK_SIZE) <= CBUF_BANKS));
++   o->fp16_global_input=o->fp16_global;
++   o->fp16_global_output=o->fp16_global;
++   if(o->fp16_global_input) o->conv_input_bytes=(fp16_extent(o->input_height,true))*(fp16_extent(o->input_width,true))*o->conv_physical_ic*2+FLOAT_GUARD;
++   if(o->fp16_global_output) o->conv_output_bytes=fp16_extent(oh,true)*fp16_extent(ow,true)*align(oc,32)*2+FLOAT_GUARD;
++   util_dynarray_foreach(&o->tasks,struct split_task,t) {
++      if(o->fp16_global_input) {
++         t->input_banks=DIV_ROUND_UP(t->input_height*(fp16_extent(o->input_width,true))*o->conv_physical_ic*2,CBUF_BANK_SIZE);
++         unsigned wb=kh*kw*o->conv_physical_ic*(dw ? 1 : t->output_channels)*2;
++         if(t->input_banks+DIV_ROUND_UP(wb,CBUF_BANK_SIZE)>CBUF_BANKS) goto fail;
++         t->weights_banks=CBUF_BANKS-t->input_banks;
++      }
++      if(o->fp16_global_input) t->input_offset=((t->conv_y*sy+1-o->padding_top)*(fp16_extent(o->input_width,true))+t->conv_x*sx+1-o->padding_left)*16;
++      if(o->fp16_global_output) t->output_offset=((t->conv_y+1)*fp16_extent(ow,true)+t->conv_x+1)*16+t->conv_c/8*fp16_extent(oh,true)*fp16_extent(ow,true)*16;
++   }
++
++   struct pipe_context *ctx = s->context;
++   struct pipe_transfer *transfer = NULL;
++   o->weights = pipe_buffer_create(ctx->screen, 0, PIPE_USAGE_DEFAULT, weight_bytes + FLOAT_GUARD);
++   o->biases = pipe_buffer_create(ctx->screen, 0, PIPE_USAGE_DEFAULT, o->conv_physical_oc * 4 + FLOAT_GUARD);
++   o->conv_input = pipe_buffer_create(ctx->screen, 0, PIPE_USAGE_DEFAULT, o->conv_input_bytes);
++   o->conv_output = pipe_buffer_create(ctx->screen, 0, PIPE_USAGE_DEFAULT, o->conv_output_bytes);
++   if (!o->weights || !o->biases || !o->conv_input || !o->conv_output)
++      goto fail;
++   _Float16 *weights = pipe_buffer_map(ctx, o->weights, PIPE_MAP_WRITE, &transfer);
++   if (!weights)
++      goto fail;
++   memset(weights, 0, pipe_buffer_size(o->weights));
++   const float *source = (const void *)w->data;
++   for (unsigned y = 0; y < kh; y++)
++      for (unsigned x = 0; x < kw; x++)
++         for (unsigned c = 0; c < oc; c++) {
++            if (dw) {
++               size_t dst = (((c / 32) * kh + y) * kw + x) * 32 + c % 32;
++               weights[dst] = (_Float16)source[(y * kw + x) * ic + c];
++            } else {
++               for (unsigned k = 0; k < ic; k++) {
++                  size_t dst = ((((((c / 16) * (o->conv_physical_ic / 32) + k / 32) * kh + y) * kw + x) * 16 + c % 16) * 32 + k % 32);
++                  weights[dst] = (_Float16)source[((c * kh + y) * kw + x) * ic + k];
++               }
++            }
++         }
++   if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
++      rkt_dump_buffer((void *)weights, "float-weights", 0, 0, 0, pipe_buffer_size(o->weights));
++   pipe_buffer_unmap(ctx, transfer);
++   void *biases = pipe_buffer_map(ctx, o->biases, PIPE_MAP_WRITE, &transfer);
++   if (!biases)
++      goto fail;
++   memset(biases, 0, pipe_buffer_size(o->biases));
++   memcpy(biases, b->data, oc * sizeof(float));
++   pipe_buffer_unmap(ctx, transfer);
++   DBG("rocket: %s FP16-input conv %ux%ux%u -> %ux%ux%u; "
++           "%u NPU tiles; FP32 bias, %s output, ReLU=%u\n", dw ? "native-depthwise" : "direct",
++           o->input_height, o->input_width, ic, oh, ow, oc,
++           util_dynarray_num_elements(&o->tasks, struct split_task), o->conv_output_f16 ? "FP16" : "FP32", o->conv_relu);
++   return true;
++fail:
++   pipe_resource_reference(&o->conv_input, NULL);
++   pipe_resource_reference(&o->conv_output, NULL);
++   pipe_resource_reference(&o->weights, NULL);
++   pipe_resource_reference(&o->biases, NULL);
++   util_dynarray_fini(&o->tasks);
++   return false;
++}
++
++/* Same NHWC -> C8/FP16 mapping as cube(), with a one-pixel halo.
++ * Four RGB pixels are converted together; inactive lanes remain zero. */
++static void
++pack_global_vector(_Float16 *dst, const float *input, unsigned h, unsigned w, unsigned channels)
++{
++   for (unsigned y=0;y<h;y++) {
++      unsigned x=0;
++      if(channels==3) {
++         for(;x+4<=w;x+=4) {
++            float32x4x3_t rgb=vld3q_f32(input+((size_t)y*w+x)*3);
++            uint16x4_t r=vreinterpret_u16_f16(vcvt_f16_f32(rgb.val[0]));
++            uint16x4_t g=vreinterpret_u16_f16(vcvt_f16_f32(rgb.val[1]));
++            uint16x4_t b=vreinterpret_u16_f16(vcvt_f16_f32(rgb.val[2]));
++            uint16x4_t z=vdup_n_u16(0);
++            uint32x2_t rg0=vreinterpret_u32_u16(vzip1_u16(r,g));
++            uint32x2_t rg1=vreinterpret_u32_u16(vzip2_u16(r,g));
++            uint32x2_t bz0=vreinterpret_u32_u16(vzip1_u16(b,z));
++            uint32x2_t bz1=vreinterpret_u32_u16(vzip2_u16(b,z));
++            uint16_t *out=(uint16_t *)(dst+cube(fp16_extent(h,true),fp16_extent(w,true),0,y+1,x+1,8));
++            vst1q_u16(out,    vcombine_u16(vreinterpret_u16_u32(vzip1_u32(rg0,bz0)),z));
++            vst1q_u16(out+8,  vcombine_u16(vreinterpret_u16_u32(vzip2_u32(rg0,bz0)),z));
++            vst1q_u16(out+16, vcombine_u16(vreinterpret_u16_u32(vzip1_u32(rg1,bz1)),z));
++            vst1q_u16(out+24, vcombine_u16(vreinterpret_u16_u32(vzip2_u32(rg1,bz1)),z));
++         }
++      }
++      for(;x<w;x++) {
++         const float *pixel=input+((size_t)y*w+x)*channels;
++         unsigned c=0;
++         for(;c+8<=channels;c+=8) {
++            float16x8_t v=vcombine_f16(vcvt_f16_f32(vld1q_f32(pixel+c)),vcvt_f16_f32(vld1q_f32(pixel+c+4)));
++            vst1q_u16((uint16_t *)(dst+cube(fp16_extent(h,true),fp16_extent(w,true),c,y+1,x+1,8)),vreinterpretq_u16_f16(v));
++         }
++         for(;c<channels;c++) dst[cube(fp16_extent(h,true),fp16_extent(w,true),c,y+1,x+1,8)]=(_Float16)pixel[c];
++      }
++   }
++}
++
++void
++rkt_upload_float_conv(struct rkt_ml_subgraph *s, struct rkt_operation *o, const float *input)
++{
++   struct pipe_context *ctx = s->context;
++   struct pipe_transfer *transfer = NULL;
++   struct pipe_resource *r = o->conv_input;
++   uint64_t t0 = rkt_profile_ns();
++   uint8_t *raw = pipe_buffer_map(ctx, r, PIPE_MAP_WRITE, &transfer);
++   if (!raw) return;
++   o->profile[0] = rkt_profile_ns() - t0; t0 = rkt_profile_ns();
++   /* This private DMA source is never written by the NPU. Shape is fixed,
++    * every logical element is replaced below, and padding remains zero. */
++   if(!o->input_padding_initialized)
++      memset(raw, 0, pipe_buffer_size(r));
++   o->input_padding_initialized=true;
++   o->profile[1] = rkt_profile_ns() - t0; t0 = rkt_profile_ns();
++   if(o->fp16_global_input) {
++      _Float16 *dst=(void *)raw;
++       pack_global_vector(dst,input,o->input_height,o->input_width,o->input_channels);
++   } else
++   util_dynarray_foreach (&o->tasks, struct split_task, t) {
++      _Float16 *tile = (void *)(raw + t->input_offset);
++      for (unsigned y = 0; y < t->input_height; y++)
++         for (unsigned x = 0; x < t->input_width; x++) {
++            int iy = (int)(t->conv_y * o->stride + y) - (int)o->padding_top;
++            int ix = (int)(t->conv_x * o->stride + x) - (int)o->padding_left;
++            if (iy < 0 || ix < 0 || iy >= o->input_height || ix >= o->input_width) continue;
++            if(o->reduce_spatial) {
++               /* Reorder coordinates only. Reduction arithmetic is the MAC. */
++               for(unsigned c=0;c<o->input_channels;c++)
++                  tile[cube(t->input_height,t->input_width,c,y,x,8)]=(_Float16)input[c*o->input_width+ix];
++               continue;
++            }
++            const float *pixel = input + ((size_t)iy * o->input_width + ix) * o->input_channels;
++            unsigned c = 0;
++            for (; c + 8 <= o->input_channels; c += 8) {
++               float16x8_t v = vcombine_f16(vcvt_f16_f32(vld1q_f32(pixel+c)),
++                                           vcvt_f16_f32(vld1q_f32(pixel+c+4)));
++               vst1q_u16((uint16_t *)(tile+cube(t->input_height,t->input_width,c,y,x,8)), vreinterpretq_u16_f16(v));
++            }
++            for (; c < o->input_channels; c++)
++               tile[cube(t->input_height, t->input_width, c, y, x, 8)] = (_Float16)pixel[c];
++         }
++   }
++   o->profile[2] = rkt_profile_ns() - t0; t0 = rkt_profile_ns();
++   if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
++      rkt_dump_buffer(raw, "float-input", 0, 0, 0, pipe_buffer_size(r));
++   pipe_buffer_unmap(ctx, transfer);
++   o->profile[3] = rkt_profile_ns() - t0; t0 = rkt_profile_ns();
++   rkt_prepare_float_output(s,o);
++}
++
++void
++rkt_prepare_float_output(struct rkt_ml_subgraph *s,struct rkt_operation *o)
++{
++   if(o->fp16_global_output && o->fp16_output_initialized) return;
++   o->fp16_output_initialized=true;
++   struct pipe_context *ctx=s->context;
++   struct pipe_resource *r=o->conv_output;
++   struct pipe_transfer *transfer=NULL;
++   uint64_t t0=rkt_profile_ns();
++   uint8_t *raw = pipe_buffer_map(ctx, r, PIPE_MAP_WRITE, &transfer);
++   if (!raw) return;
++   o->profile[4] = rkt_profile_ns() - t0; t0 = rkt_profile_ns();
++   memset(raw, 0xa5, pipe_buffer_size(r));
++   if(o->fp16_global_output) memset(raw,0,pipe_buffer_size(r)-FLOAT_GUARD);
++   pipe_buffer_unmap(ctx, transfer);
++   o->profile[5] = rkt_profile_ns() - t0;
++}
++
++void
++rkt_check_float_guards(struct rkt_operation *o,const uint8_t *raw)
++{
++   if(o->fp16_global_output) {
++      for(unsigned b=o->conv_output_bytes-FLOAT_GUARD;b<o->conv_output_bytes;b++) if(raw[b]!=0xa5) {fprintf(stderr,"global guard corrupt %u\n",b);o->error = EIO; return;}
++      return;
++   }
++   bool vector=true;
++   util_dynarray_foreach (&o->tasks,struct split_task,t) {
++      const uint8_t *tile=raw+t->output_offset;
++      unsigned b=t->conv_output_bytes,end=align(b+FLOAT_GUARD,4096);
++      if (vector) {
++         const uint8x16_t expected=vdupq_n_u8(0xa5);
++         for (;b+16<=end;b+=16) {
++            uint8x16_t different=veorq_u8(vld1q_u8(tile+b),expected);
++            if (vmaxvq_u8(different)) {
++               fprintf(stderr,"rocket: output guard overwritten: tile=%u block=%u\n",t->num,b);
++               o->error = EIO; return;
++            }
++         }
++      }
++      for (;b<end;b++) {
++         if (tile[b] != 0xa5) {
++            fprintf(stderr,"rocket: output guard overwritten: tile=%u byte=%u\n",t->num,b);
++            o->error = EIO; return;
++         }
++      }
++   }
++}
++
++void
++rkt_read_float_conv(struct rkt_operation *o, const uint8_t *raw, float *output)
++{
++   rkt_check_float_guards(o,raw);
++   if (o->error) return;
++   if(o->fp16_global_output) {
++      const _Float16 *src=(const void *)raw;
++      for(unsigned y=0;y<o->output_height;y++) for(unsigned x=0;x<o->output_width;x++) for(unsigned c=0;c<o->output_channels;c++)
++         output[(y*o->output_width+x)*o->output_channels+c]=(float)src[cube(fp16_extent(o->output_height,true),fp16_extent(o->output_width,true),c,y+1,x+1,8)];
++      return;
++   }
++   util_dynarray_foreach (&o->tasks, struct split_task, t) {
++      const uint8_t *tile = raw + t->output_offset;
++      for (unsigned y = 0; y < t->output_height && y + t->conv_y < o->output_height; y++)
++         for (unsigned x = 0; x < t->output_width && x + t->conv_x < o->output_width; x++) {
++            float *pixel = output + (((size_t)t->conv_y+y)*o->output_width+t->conv_x+x)*o->output_channels + t->conv_c;
++            unsigned channels=MIN2(t->output_channels,o->output_channels-t->conv_c);
++            unsigned c = 0;
++            if (o->conv_output_f16) {
++               for (; c + 8 <= channels; c += 8) {
++                  const uint16_t *src = (const uint16_t *)tile+cube(t->output_height,t->output_width,c,y,x,8);
++                  float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(src));
++                  vst1q_f32(pixel+c,vcvt_f32_f16(vget_low_f16(h)));
++                  vst1q_f32(pixel+c+4,vcvt_f32_f16(vget_high_f16(h)));
++               }
++               for (; c < channels; c++)
++                  pixel[c] = (float)((const _Float16 *)tile)[cube(t->output_height,t->output_width,c,y,x,8)];
++            } else {
++               for (; c + 4 <= channels; c += 4) {
++                  const float *src = (const float *)tile+cube(t->output_height,t->output_width,c,y,x,4);
++                  vst1q_f32(pixel+c,vld1q_f32(src));
++               }
++               for (; c < channels; c++)
++                  pixel[c] = ((const float *)tile)[cube(t->output_height,t->output_width,c,y,x,4)];
++            }
++         }
++   }
++   if (getenv("ROCKET_VALIDATE_VERBOSE")) fprintf(stderr, "rocket: completed FP16 convolution: %u output values; tile guards intact\n",
++           o->output_height * o->output_width * o->output_channels);
++}
++
++void
++rkt_fill_float_conv_regcmd(struct rkt_ml_subgraph *s, const struct rkt_operation *o,
++                         struct util_dynarray *regs, unsigned task_num)
++{
++   const struct split_task *t = util_dynarray_element(&o->tasks, struct split_task, task_num);
++   unsigned ic = o->conv_physical_ic, oc = t->output_channels;
++   unsigned ih = t->input_height, iw = t->input_width;
++   unsigned oh = t->output_height, ow = t->output_width;
++   unsigned kh = o->weights_height, kw = o->weights_width;
++   unsigned kernels = o->depthwise ? 1 : oc;
++   unsigned mode = o->depthwise ? 3 : 0;
++   /* Native direct FP16 writes two-byte values; depthwise retains its
++    * independently validated four-byte stride geometry. */
++   unsigned output_stride_bytes = o->conv_output_f16 && !o->depthwise ? 2 : 4;
++   unsigned size_e = output_stride_bytes - 1;
++   /* The capture supplies initialization/reset values and ordering. Every shape,
++    * precision, activation and address field below is parameterized from the
++    * MIT register definitions / RK3588 TRM and checked against hardware captures.
++    * Native DW FP32 output is unvalidated: only its verified FP16 writer is used.
++    * CPEND must be bypassed when enabling the FP32 bias ALU: the native DW
++    * control changes from Inf/wrong values to exact FP16 results with this bit.
++    */
++   for (unsigned n = 0; n < ARRAY_SIZE(float_tile_registers); n++) {
++      uint64_t reg = float_tile_registers[n];
++      uint64_t value = (reg >> 16) & UINT32_MAX;
++      switch (reg & 0xffff) {
++      case 0x100c: value = CNA_CONV_CON1_CONV_MODE(mode) | CNA_CONV_CON1_IN_PRECISION(2) | CNA_CONV_CON1_PROC_PRECISION(2); break;
++      case 0x1010: value = CNA_CONV_CON2_FEATURE_GRAINS(o->depthwise ? 52 : ih + 1); break;
++      case 0x1014: value = CNA_CONV_CON3_CONV_X_STRIDE(o->stride) | CNA_CONV_CON3_CONV_Y_STRIDE(o->stride); break;
++      case 0x1020: value = CNA_DATA_SIZE0_DATAIN_WIDTH(o->fp16_global_input ? fp16_extent(o->input_width,true) : iw) | CNA_DATA_SIZE0_DATAIN_HEIGHT(ih); break;
++      case 0x1024: value = CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL(ic - 1) | CNA_DATA_SIZE1_DATAIN_CHANNEL(ic); break;
++      case 0x1028: value = ow; break;
++      case 0x102c: value = oh * ow; break;
++      case 0x1030: value = kh * kw * ic * kernels * 2; break;
++      case 0x1034: value = kh * kw * ic * 2; break;
++      case 0x1038: value = CNA_WEIGHT_SIZE2_WEIGHT_WIDTH(kw) | CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT(kh) | CNA_WEIGHT_SIZE2_WEIGHT_KERNELS(kernels); break;
++      case 0x1040: value = CNA_CBUF_CON0_WEIGHT_BANK(t->weights_banks) | CNA_CBUF_CON0_DATA_BANK(t->input_banks); break;
++      case 0x1044: value = DIV_ROUND_UP((o->fp16_global_input ? fp16_extent(o->input_width,true) : iw) * ic, 32); break;
++      case 0x1070: value = rkt_resource(o->conv_input)->phys_addr + t->input_offset; break;
++      case 0x107c: value = (o->fp16_global_input ? fp16_extent(o->input_width,true) : iw) * 4; break;
++      case 0x1080: value = o->fp16_global_input ? (fp16_extent(o->input_width,true))*(fp16_extent(o->input_height,true)-4) : iw * (ih - 4); break;
++      case 0x1084: value = CNA_FC_DATA_SIZE0_DMA_WIDTH(o->fp16_global_input ? fp16_extent(o->input_width,true) : iw) | CNA_FC_DATA_SIZE0_DMA_HEIGHT(ih); break;
++      case 0x1088: value = ic; break;
++      case 0x1110: value = rkt_resource(o->weights)->phys_addr + t->conv_c*kh*kw*ic*2; break;
++      case 0x3010: value = CORE_MISC_CFG_PROC_PRECISION(2) | CORE_MISC_CFG_QD_EN(1) | CORE_MISC_CFG_DW_EN(o->depthwise); break;
++      case 0x3014: value = CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT(oh - 1) | CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH(ow - 1); break;
++      case 0x3018: value = oc - 1; break;
++      case 0x400c: value = DPU_FEATURE_MODE_CFG_BURST_LEN(15) | DPU_FEATURE_MODE_CFG_CONV_MODE(mode) | DPU_FEATURE_MODE_CFG_OUTPUT_MODE(2); break;
++      case 0x4010: value = DPU_DATA_FORMAT_OUT_PRECISION(o->conv_output_f16 ? 2 : 5) | DPU_DATA_FORMAT_IN_PRECISION(2) | DPU_DATA_FORMAT_PROC_PRECISION(2); break;
++      case 0x4020: value = rkt_resource(o->conv_output)->phys_addr + t->output_offset; break;
++      case 0x4024: value = DPU_DST_SURF_STRIDE_DST_SURF_STRIDE(o->fp16_global_output ? (fp16_extent(o->output_height,true))*(fp16_extent(o->output_width,true)) : oh * ow); break;
++      case 0x4030: case 0x500c: value = ow - 1; break;
++      case 0x4034: case 0x5010: value = oh - 1; break;
++      case 0x4038: if(o->fp16_global_output) {unsigned gap=fp16_extent(o->output_width,true)-ow;value=gap|(gap<<16);} break;
++      case 0x403c: value = DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL(oc - 1) | DPU_DATA_CUBE_CHANNEL_CHANNEL(oc - 1); break;
++      case 0x4040: value = DPU_BS_CFG_BS_ALU_ALGO(2) | DPU_BS_CFG_BS_ALU_SRC(1) | DPU_BS_CFG_BS_MUL_BYPASS(1) | DPU_BS_CFG_BS_RELU_BYPASS(!o->conv_relu); break;
++      case 0x4050: value = DPU_BS_OW_CFG_SIZE_E_2(size_e) | DPU_BS_OW_CFG_SIZE_E_1(size_e) | DPU_BS_OW_CFG_SIZE_E_0(size_e) | DPU_BS_OW_CFG_OD_BYPASS(1); break;
++      case 0x4054: value = 0; break; /* CPEND bypassed. */
++      case 0x4058: case 0x5014: value = oc - 1; break;
++      case 0x405c: value = ((oh - 1) << 16) | (ow - 1); break;
++      case 0x4060: if(o->conv_prelu) value = DPU_BN_CFG_BN_ALU_BYPASS(1) | DPU_BN_CFG_BN_MUL_PRELU(1) | DPU_BN_CFG_BN_RELU_BYPASS(1); break;
++      case 0x4068: if(o->conv_prelu) value = DPU_BN_MUL_CFG_BN_MUL_SRC(1); break;
++      case 0x5028: if(o->conv_prelu) value = 4u << 1; break;
++      case 0x502c: if(o->conv_prelu) value = rkt_resource(o->conv_prelu)->phys_addr + t->conv_c*2; break;
++      case 0x4084: value = o->conv_output_f16 ? 0x10001 : 1; break;
++      case 0x40c0: value = DPU_SURFACE_ADD_SURF_ADD((o->fp16_global_output ? (fp16_extent(o->output_height,true))*(fp16_extent(o->output_width,true)) : oh * ow) * output_stride_bytes); break;
++      case 0x5020: value = rkt_resource(o->biases)->phys_addr + t->conv_c*4; break;
++      case 0x5044: value = (2u << 15) | (15u << 11) | (2u << 5) | (1u << 4) | (mode << 1); break;
++      default: break;
++      }
++      if (value > UINT32_MAX) { rkt_context(s->context)->error = EINVAL; return; }
++      reg = (reg & UINT64_C(0xffff00000000ffff)) | (value << 16);
++      util_dynarray_append(regs, reg);
++   }
++}
++/* SPDX-License-Identifier: MIT
++ * Standalone FP16 NPU operations. No host arithmetic other than
++ * boundary format conversion; all acceptance tests use independent CPU output.
++ */
++#include <math.h>
++static enum rkt_float_operation aux_kind(const struct pipe_ml_operation *p) {
++   switch(p->type) {
++   case PIPE_ML_OPERATION_TYPE_CONCATENATION:return RKT_FLOAT_CONCAT;
++   case PIPE_ML_OPERATION_TYPE_ADD:return RKT_FLOAT_ADD;
++   case PIPE_ML_OPERATION_TYPE_MUL:return RKT_FLOAT_MUL;
++   case PIPE_ML_OPERATION_TYPE_SQRT:return RKT_FLOAT_SQRT;
++   case PIPE_ML_OPERATION_TYPE_RSQRT:return RKT_FLOAT_RSQRT;
++   case PIPE_ML_OPERATION_TYPE_STRIDED_SLICE:return RKT_FLOAT_SLICE;
++   case PIPE_ML_OPERATION_TYPE_DIV:return RKT_FLOAT_DIV;
++   case PIPE_ML_OPERATION_TYPE_NEG:return RKT_FLOAT_NEG;
++   case PIPE_ML_OPERATION_TYPE_SUBTRACT:return RKT_FLOAT_SUB;
++   case PIPE_ML_OPERATION_TYPE_SQUARED_DIFFERENCE:return RKT_FLOAT_SQUARED_DIFF;
++   case PIPE_ML_OPERATION_TYPE_LEAKY_RELU:return RKT_FLOAT_PRELU;
++   case PIPE_ML_OPERATION_TYPE_POOLING:return RKT_FLOAT_MAX_POOL;
++   case PIPE_ML_OPERATION_TYPE_PAD:return RKT_FLOAT_PAD;
++   case PIPE_ML_OPERATION_TYPE_LOGISTIC:return RKT_FLOAT_SIGMOID;
++   case PIPE_ML_OPERATION_TYPE_RESHAPE:return RKT_FLOAT_RESHAPE;
++   default:return RKT_FLOAT_NONE;
++   }
++}
++bool rkt_float_aux_supported(const struct pipe_ml_operation *p) {
++   const struct pipe_tensor *a=p->input_tensors[0],*b=p->output_tensors[0];
++   if(!fp32(a) || !fp32(b) || a->dims[0]!=1 || b->dims[0]!=1) return false;
++   enum rkt_float_operation kind=aux_kind(p);
++   for(unsigned d=1;d<4;d++) {
++      unsigned limit=((kind==RKT_FLOAT_RESHAPE || kind==RKT_FLOAT_CONCAT) && d==3 && a->dims[1]==1 && a->dims[2]==1) ? RKT_FLOAT_MAX_VECTOR_CHANNELS:256;
++      if(!a->dims[d] || !b->dims[d] || a->dims[d]>limit || b->dims[d]>limit) return false;
++   }
++   if(kind==RKT_FLOAT_CONCAT) {
++      if(p->input_count!=2 || p->conc.axis!=3) return false;
++      const struct pipe_tensor *side=p->input_tensors[1];
++      if(!fp32(side) || a->dims[3]%8 || a->dims[3]+side->dims[3]!=b->dims[3]) return false;
++      for(unsigned d=0;d<3;d++) if(a->dims[d]!=b->dims[d] || side->dims[d]!=b->dims[d]) return false;
++      return side->dims[3]>0;
++   }
++   if(kind==RKT_FLOAT_SLICE) {
++      if(a->dims[1]!=1 || b->dims[1]!=1 || a->dims[3]!=b->dims[3]) return false;
++      for(unsigned j=0;j<4;j++) if(p->slice.strides[j]!=1 || p->slice.begin[j]<0 || p->slice.end[j]>(int)a->dims[j] ||
++         p->slice.end[j]-p->slice.begin[j]!=(int)b->dims[j]) return false;
++      return p->slice.begin[0]==0 && p->slice.begin[1]==0 && p->slice.begin[3]==0;
++   }
++   if(kind==RKT_FLOAT_NEG) return !memcmp(a->dims,b->dims,sizeof(a->dims));
++   if(kind==RKT_FLOAT_SQRT || kind==RKT_FLOAT_RSQRT) return !memcmp(a->dims,b->dims,sizeof(a->dims));
++   /* Positive scalar denominator used by landmark scale normalization.
++    * Runtime operand-domain validation runs before submission. */
++   if(kind==RKT_FLOAT_DIV && (p->input_count!=2 ||
++      a->dims[1]!=1 || a->dims[3]>2 || p->input_tensors[1]->dims[1]!=1 ||
++      p->input_tensors[1]->dims[2]!=1 || p->input_tensors[1]->dims[3]!=1)) return false;
++   if(kind==RKT_FLOAT_ADD || kind==RKT_FLOAT_MUL || kind==RKT_FLOAT_SUB || kind==RKT_FLOAT_SQUARED_DIFF || kind==RKT_FLOAT_DIV) {
++      if(p->input_count!=2 || !fp32(p->input_tensors[1]) || (kind==RKT_FLOAT_ADD && p->add.relu)) return false;
++      const struct pipe_tensor *side=p->input_tensors[1];
++      for(unsigned d=0;d<4;d++) {
++         if(!side->dims[d] || (a->dims[d]!=1 && a->dims[d]!=b->dims[d]) ||
++            (side->dims[d]!=1 && side->dims[d]!=b->dims[d]) ||
++            MAX2(a->dims[d],side->dims[d])!=b->dims[d]) return false;
++      }
++      return true;
++   }
++   if(kind==RKT_FLOAT_PRELU) {
++      if(p->input_count!=2 || !fp32(p->input_tensors[1]) || !p->input_tensors[1]->data) return false;
++      const struct pipe_tensor *alpha=p->input_tensors[1];
++      return !memcmp(a->dims,b->dims,sizeof(a->dims)) && alpha->dims[0]==1 && alpha->dims[1]==1 && alpha->dims[2]==1 && alpha->dims[3]==a->dims[3];
++   }
++   if(kind==RKT_FLOAT_MAX_POOL) return p->pooling.type==PIPE_ML_POOLING_TYPE_MAX && p->pooling.filter_width==2 && p->pooling.filter_height==2 && p->pooling.stride_x==2 && p->pooling.stride_y==2 && !p->pooling.padding_left && !p->pooling.padding_top && !p->pooling.padding_bottom && !p->pooling.padding_right && a->dims[1]==2*b->dims[1] && a->dims[2]==2*b->dims[2] && a->dims[3]==b->dims[3];
++   if(kind==RKT_FLOAT_PAD) {
++      bool channel_pad=!p->pad.before_x && !p->pad.after_x && !p->pad.before_y && !p->pad.after_y && !p->pad.before_z && a->dims[1]==b->dims[1] && a->dims[2]==b->dims[2] && a->dims[3]%8==0 && a->dims[3]+p->pad.after_z==b->dims[3];
++      bool spatial_pad=!p->pad.before_z && !p->pad.after_z && a->dims[3]%8==0 && a->dims[3]==b->dims[3] &&
++         p->pad.before_x<=1 && p->pad.after_x<=1 && p->pad.before_y<=1 && p->pad.after_y<=1 &&
++         a->dims[1]+p->pad.before_x+p->pad.after_x==b->dims[1] && a->dims[2]+p->pad.before_y+p->pad.after_y==b->dims[2];
++      return channel_pad || spatial_pad;
++   }
++   if(kind==RKT_FLOAT_SIGMOID || kind==RKT_FLOAT_RESHAPE) {
++      if(!memcmp(a->dims,b->dims,sizeof(a->dims))) return true;
++      return a->dims[1]*a->dims[2]*a->dims[3]==1 && b->dims[1]*b->dims[2]*b->dims[3]==1;
++   }
++   return false;
++}
++bool rkt_lower_float_aux(struct rkt_ml_subgraph *s,const struct pipe_ml_operation *p,struct rkt_operation *o) {
++   if(!rkt_float_aux_supported(p)) return false;
++   const struct pipe_tensor *a=p->input_tensors[0],*b=p->output_tensors[0];
++   o->float_aux=aux_kind(p);
++   if(o->float_aux==RKT_FLOAT_SLICE) o->aux_slice_x=p->slice.begin[2];
++   if(o->float_aux==RKT_FLOAT_PAD) {o->padding_top=p->pad.before_x;o->padding_left=p->pad.before_y;}
++   o->input_index=a->index;o->output_index=b->index;
++   o->input_height=a->dims[1];o->input_width=a->dims[2];o->input_channels=a->dims[3];
++   o->output_height=b->dims[1];o->output_width=b->dims[2];o->output_channels=b->dims[3];
++   o->aux_binary=o->float_aux==RKT_FLOAT_ADD || o->float_aux==RKT_FLOAT_MUL || o->float_aux==RKT_FLOAT_SUB || o->float_aux==RKT_FLOAT_SQUARED_DIFF || o->float_aux==RKT_FLOAT_DIV || o->float_aux==RKT_FLOAT_CONCAT;
++   if(o->aux_binary) {
++      if(o->float_aux!=RKT_FLOAT_CONCAT) {o->input_height=o->output_height;o->input_width=o->output_width;o->input_channels=o->output_channels;}
++      for(unsigned j=0;j<2;j++) {
++         memcpy(o->aux_dims[j],p->input_tensors[j]->dims,sizeof(o->aux_dims[j]));
++         o->aux_bytes[j]=4;
++         for(unsigned d=0;d<4;d++) o->aux_bytes[j]*=o->aux_dims[j][d];
++      }
++   }
++   o->fp16_global_input=((o->input_height>=4 && o->input_width>=4) || (o->float_aux!=RKT_FLOAT_MAX_POOL && o->float_aux!=RKT_FLOAT_PAD && fp16_small(o->input_height,o->input_width)));
++   o->fp16_global_output=((o->output_height>=4 && o->output_width>=4) || (o->float_aux!=RKT_FLOAT_MAX_POOL && o->float_aux!=RKT_FLOAT_PAD && fp16_small(o->output_height,o->output_width)));
++   o->conv_physical_ic=align(o->input_channels,o->fp16_global_input ? 32 : 8);o->conv_physical_oc=align(o->output_channels,o->fp16_global_output ? 32 : 8);
++   o->conv_input_bytes=(fp16_extent(o->input_height,o->fp16_global_input))*(fp16_extent(o->input_width,o->fp16_global_input))*o->conv_physical_ic*2;
++   o->conv_output_bytes=(fp16_extent(o->output_height,o->fp16_global_output))*(fp16_extent(o->output_width,o->fp16_global_output))*o->conv_physical_oc*2;
++   o->conv_input=pipe_buffer_create(s->context->screen,0,PIPE_USAGE_DEFAULT,o->conv_input_bytes+FLOAT_GUARD);
++   o->conv_output=pipe_buffer_create(s->context->screen,0,PIPE_USAGE_DEFAULT,o->conv_output_bytes+FLOAT_GUARD);
++   if(!o->conv_input || !o->conv_output) return false;
++   if(o->aux_binary) {
++      o->add_tensor=p->input_tensors[1]->index;
++      o->aux_side_constant=p->input_tensors[1]->is_constant;
++      unsigned side_bytes=o->float_aux==RKT_FLOAT_CONCAT ? (fp16_extent(o->input_height,o->fp16_global_input))*(fp16_extent(o->input_width,o->fp16_global_input))*align(o->aux_dims[1][3],o->fp16_global_input ? 32:8)*2 : o->conv_input_bytes;
++      o->conv_side=pipe_buffer_create(s->context->screen,0,PIPE_USAGE_DEFAULT,side_bytes+FLOAT_GUARD);
++      if(!o->conv_side) return false;
++   }
++   if(o->float_aux==RKT_FLOAT_MAX_POOL && o->fp16_global_output) {
++      o->aux_scratch=pipe_buffer_create(s->context->screen,0,PIPE_USAGE_DEFAULT,o->output_height*o->output_width*o->conv_physical_ic*2+FLOAT_GUARD);
++      if(!o->aux_scratch) return false;
++   }
++   if(o->float_aux==RKT_FLOAT_SQUARED_DIFF || o->float_aux==RKT_FLOAT_DIV) {
++      o->aux_scratch=pipe_buffer_create(s->context->screen,0,PIPE_USAGE_DEFAULT,o->conv_output_bytes+FLOAT_GUARD);
++      if(!o->aux_scratch) return false;
++      struct pipe_transfer *tr=NULL;uint8_t *raw=pipe_buffer_map(s->context,o->aux_scratch,PIPE_MAP_WRITE,&tr);
++      if(!raw) return false;
++      memset(raw,0,o->conv_output_bytes);memset(raw+o->conv_output_bytes,0xa5,FLOAT_GUARD);pipe_buffer_unmap(s->context,tr);
++   }
++   if(o->float_aux==RKT_FLOAT_PRELU) {
++      o->conv_prelu=pipe_buffer_create(s->context->screen,0,PIPE_USAGE_DEFAULT,o->conv_physical_ic*2+256);
++      if(!o->conv_prelu) return false;
++      struct pipe_transfer *tr=NULL;_Float16 *ptr=pipe_buffer_map(s->context,o->conv_prelu,PIPE_MAP_WRITE,&tr);
++      if(!ptr) return false;
++      memset(ptr,0,pipe_buffer_size(o->conv_prelu));const float *alpha=(void *)p->input_tensors[1]->data;
++      for(unsigned c=0;c<o->input_channels;c++) ptr[c]=(_Float16)alpha[c];
++      pipe_buffer_unmap(s->context,tr);
++   }
++   o->tasks=UTIL_DYNARRAY_INIT;struct split_task t={0};util_dynarray_append(&o->tasks,t);if(o->aux_scratch || o->float_aux==RKT_FLOAT_CONCAT) util_dynarray_append(&o->tasks,t);
++   DBG("FLOAT_AUX kind=%u input=%u output=%u %ux%ux%u -> %ux%ux%u\n",o->float_aux,o->input_index,o->output_index,o->input_height,o->input_width,o->input_channels,o->output_height,o->output_width,o->output_channels);
++   return true;
++}
++static void fp16_pack(struct rkt_ml_subgraph *s,struct rkt_operation *o,struct pipe_resource *res,const float *in,const unsigned *dims,bool initialized) {
++   struct pipe_transfer *tr=NULL;uint8_t *raw=pipe_buffer_map(s->context,res,PIPE_MAP_WRITE,&tr);if(!raw) return;
++   if(!initialized) memset(raw,0,pipe_buffer_size(res));
++   _Float16 *h=(void *)raw;unsigned halo=o->fp16_global_input;
++    {
++      for(unsigned y=0;y<o->input_height;y++) for(unsigned x=0;x<o->input_width;x++) {
++         unsigned base=dims ? ((dims[1]==1 ? 0:y)*dims[2]+(dims[2]==1 ? 0:x))*dims[3] : (y*o->input_width+x)*o->input_channels;
++         bool broadcast=dims && dims[3]==1;
++         unsigned c=0;
++         for(;c+8<=o->input_channels;c+=8) {
++            float16x8_t v;
++            if(broadcast) {float16x4_t a=vcvt_f16_f32(vdupq_n_f32(in[base]));v=vcombine_f16(a,a);}
++            else v=vcombine_f16(vcvt_f16_f32(vld1q_f32(in+base+c)),vcvt_f16_f32(vld1q_f32(in+base+c+4)));
++            vst1q_u16((uint16_t *)(h+cube(fp16_extent(o->input_height,halo),fp16_extent(o->input_width,halo),c,y+halo,x+halo,8)),vreinterpretq_u16_f16(v));
++         }
++         for(;c<o->input_channels;c++) h[cube(fp16_extent(o->input_height,halo),fp16_extent(o->input_width,halo),c,y+halo,x+halo,8)]=(_Float16)in[base+(broadcast ? 0:c)];
++      }
++   }
++   pipe_buffer_unmap(s->context,tr);
++}
++void rkt_upload_float_aux(struct rkt_ml_subgraph *s,struct rkt_operation *o,const float *in) {
++   if(in) {fp16_pack(s,o,o->conv_input,in,o->aux_binary ? o->aux_dims[0]:NULL,o->input_padding_initialized);o->input_padding_initialized=true;}
++   if(o->conv_side && !o->conv_native_side && !(o->aux_side_constant && o->aux_side_initialized)) {
++      struct pipe_transfer *tr=NULL;const float *side=pipe_buffer_map(s->context,&rkt_get_tensor(s,o->add_tensor)->base,PIPE_MAP_READ,&tr);if(!side) return;
++      struct rkt_operation view=*o;
++      if(o->float_aux==RKT_FLOAT_CONCAT) view.input_channels=o->aux_dims[1][3];
++      fp16_pack(s,&view,o->conv_side,side,o->aux_binary ? o->aux_dims[1]:NULL,o->aux_side_initialized);pipe_buffer_unmap(s->context,tr);
++      o->aux_side_initialized=true;
++      if(getenv("ROCKET_PROFILE") && o->aux_side_constant) fprintf(stderr,"CONST_PACK out=%u bytes=%u\n",o->output_index,pipe_buffer_size(o->conv_side));
++   }
++   if(o->fp16_output_initialized) return;
++   o->fp16_output_initialized=true;
++   struct pipe_transfer *tr=NULL;uint8_t *raw=pipe_buffer_map(s->context,o->conv_output,PIPE_MAP_WRITE,&tr);if(!raw) return;
++   memset(raw,0,o->conv_output_bytes);memset(raw+o->conv_output_bytes,0xa5,FLOAT_GUARD);pipe_buffer_unmap(s->context,tr);
++}
++static void fp16_check_guard(struct rkt_operation *o,const uint8_t *raw,unsigned start,const char *kind) {
++   unsigned i=start,end=start+FLOAT_GUARD;
++    {
++      uint8x16_t expected=vdupq_n_u8(0xa5);
++      for(;i+16<=end;i+=16) if(vmaxvq_u8(veorq_u8(vld1q_u8(raw+i),expected))) {
++         fprintf(stderr,"float %s guard corrupt block=%u\n",kind,i);o->error = EIO; return;
++      }
++   }
++   for(;i<end;i++) if(raw[i]!=0xa5) {fprintf(stderr,"float %s guard corrupt byte=%u\n",kind,i);o->error = EIO; return;}
++}
++void rkt_check_float_scratch(struct rkt_ml_subgraph *s,struct rkt_operation *o) {
++   struct pipe_transfer *tr=NULL;const uint8_t *raw=pipe_buffer_map(s->context,o->aux_scratch,PIPE_MAP_READ,&tr);
++   if(!raw) return;
++   fp16_check_guard(o,raw,o->conv_output_bytes,"scratch");
++   pipe_buffer_unmap(s->context,tr);
++}
++void rkt_read_float_aux(struct rkt_operation *o,const uint8_t *raw,float *out) {
++   uint64_t begin=rkt_profile_ns();
++   fp16_check_guard(o,raw,o->conv_output_bytes,"aux");
++   if (o->error) return;
++   uint64_t guarded=rkt_profile_ns();
++   const _Float16 *h=(void *)raw;
++    {
++      for(unsigned y=0;y<o->output_height;y++) for(unsigned x=0;x<o->output_width;x++) {
++         float *dst=out+(y*o->output_width+x)*o->output_channels;unsigned c=0;
++         for(;c+8<=o->output_channels;c+=8) {
++            float16x8_t v=vreinterpretq_f16_u16(vld1q_u16((const uint16_t *)(h+cube(fp16_extent(o->output_height,o->fp16_global_output),fp16_extent(o->output_width,o->fp16_global_output),c,y+o->fp16_global_output,x+o->fp16_global_output,8))));
++            vst1q_f32(dst+c,vcvt_f32_f16(vget_low_f16(v)));vst1q_f32(dst+c+4,vcvt_f32_f16(vget_high_f16(v)));
++         }
++         for(;c<o->output_channels;c++) dst[c]=(float)h[cube(fp16_extent(o->output_height,o->fp16_global_output),fp16_extent(o->output_width,o->fp16_global_output),c,y+o->fp16_global_output,x+o->fp16_global_output,8)];
++      }
++   }
++   if(getenv("ROCKET_PROFILE")) fprintf(stderr,"PROFILE_AUX_READ out=%u guard=%lu convert=%lu\n",o->output_index,guarded-begin,rkt_profile_ns()-guarded);
++}
++static void fp16_emit(struct util_dynarray *regs,unsigned reg,unsigned val) {
++   uint64_t word=((uint64_t)(rkt_get_target(reg)|1)<<48)|((uint64_t)val<<16)|reg;util_dynarray_append(regs,word);
++}
++#define FME(reg,val) fp16_emit(regs,reg,val)
++void rkt_fill_float_aux_regcmd(struct rkt_ml_subgraph *s,const struct rkt_operation *o,struct util_dynarray *regs,unsigned task_num) {
++   enum rkt_float_operation kind=o->float_aux;
++   if(kind==RKT_FLOAT_SQUARED_DIFF) kind=task_num==0 ? RKT_FLOAT_SUB:RKT_FLOAT_MUL;
++   if(kind==RKT_FLOAT_DIV) kind=task_num==0 ? RKT_FLOAT_RECIPROCAL:RKT_FLOAT_MUL;
++   bool bit_lut=kind==RKT_FLOAT_SQRT || kind==RKT_FLOAT_RSQRT || kind==RKT_FLOAT_RECIPROCAL;
++   bool dense=bit_lut;
++   bool shifted=false;
++   if(kind==RKT_FLOAT_ADD && o->conv_prelu && task_num==1) kind=RKT_FLOAT_PRELU;
++   unsigned iw=o->input_width,ih=o->input_height,ow=o->output_width,oh=o->output_height,c=o->conv_physical_ic;
++   unsigned input=rkt_resource(o->conv_input)->phys_addr,output=rkt_resource(o->conv_output)->phys_addr;
++   unsigned ipw=fp16_extent(iw,o->fp16_global_input),iph=fp16_extent(ih,o->fp16_global_input),opw=fp16_extent(ow,o->fp16_global_output),oph=fp16_extent(oh,o->fp16_global_output);
++   input+=o->fp16_global_input*(ipw+1)*16;output+=o->fp16_global_output*(opw+1)*16;
++   /* ADD preserves zero halo and padding lanes. Process the complete cube,
++    * keeping both memory operands contiguous, without a strided EW view. */
++   if(kind==RKT_FLOAT_ADD || kind==RKT_FLOAT_MUL || kind==RKT_FLOAT_SUB) {iw=ipw;ih=iph;ow=opw;oh=oph;input=rkt_resource(o->conv_input)->phys_addr;output=rkt_resource(o->conv_output)->phys_addr;}
++   unsigned side=o->conv_side ? rkt_resource(o->conv_side)->phys_addr:0;
++   /* SUB: BN negates the second operand; EW adds the first operand.
++    * Squared difference keeps that FP16 result on-device for a second MUL. */
++   if(kind==RKT_FLOAT_SUB) {unsigned a=input;input=side;side=a;}
++   if(o->float_aux==RKT_FLOAT_SQUARED_DIFF) {
++      unsigned scratch=rkt_resource(o->aux_scratch)->phys_addr;
++      if(task_num==0) output=scratch;
++      else {input=scratch;side=scratch;}
++   }
++   if(o->float_aux==RKT_FLOAT_DIV) {
++      unsigned scratch=rkt_resource(o->aux_scratch)->phys_addr;
++      if(task_num==0) {
++         /* The reciprocal processes the logical rectangle, unlike the full
++          * padded-cube MUL pass. Preserve both logical origins. */
++         input=side+o->fp16_global_input*(ipw+1)*16;
++         output=scratch+o->fp16_global_output*(opw+1)*16;
++      }
++      else side=scratch;
++   }
++   if(kind==RKT_FLOAT_ADD && o->conv_prelu) output=rkt_resource(o->aux_scratch)->phys_addr;
++   if(kind==RKT_FLOAT_PRELU && o->float_aux==RKT_FLOAT_ADD) input=rkt_resource(o->aux_scratch)->phys_addr+o->fp16_global_input*(ipw+1)*16;
++   if(kind==RKT_FLOAT_CONCAT) {
++      c=o->aux_dims[task_num][3];
++      if(task_num==1) {
++         input=rkt_resource(o->conv_side)->phys_addr+o->fp16_global_input*(ipw+1)*16;
++         output+=(o->aux_dims[0][3]/8)*opw*oph*16;
++      }
++   }
++   if(kind==RKT_FLOAT_SLICE) {input+=o->aux_slice_x*16;iw=ow;ih=oh;}
++   /* PAD writes only the original rectangle into a zero-initialized cube.
++    * Source and destination retain their independent physical surface strides. */
++   if(kind==RKT_FLOAT_PAD) {c=o->input_channels;output+=(o->padding_top*opw+o->padding_left)*16;ow=iw;oh=ih;}
++   if(o->float_aux==RKT_FLOAT_MAX_POOL && o->aux_scratch && task_num==1) {input=rkt_resource(o->aux_scratch)->phys_addr;iw=ow;ih=oh;ipw=ow;iph=oh;}
++   if(kind==RKT_FLOAT_MAX_POOL && task_num==0) {
++      FME(REG_PPU_S_POINTER,14);FME(REG_PPU_RDMA_RDMA_S_POINTER,14);
++      FME(REG_PPU_DATA_CUBE_IN_WIDTH,iw-1);FME(REG_PPU_DATA_CUBE_IN_HEIGHT,ih-1);FME(REG_PPU_DATA_CUBE_IN_CHANNEL,c-1);
++      FME(REG_PPU_DATA_CUBE_OUT_WIDTH,ow-1);FME(REG_PPU_DATA_CUBE_OUT_HEIGHT,oh-1);FME(REG_PPU_DATA_CUBE_OUT_CHANNEL,c-1);
++      FME(REG_PPU_OPERATION_MODE_CFG,0x11);FME(REG_PPU_POOLING_KERNEL_CFG,1|(1<<8)|(1<<16)|(1<<20));
++      FME(REG_PPU_RECIP_KERNEL_WIDTH,0);FME(REG_PPU_RECIP_KERNEL_HEIGHT,0);FME(REG_PPU_POOLING_PADDING_CFG,0);FME(REG_PPU_PADDING_VALUE_1_CFG,0xfc00);FME(REG_PPU_PADDING_VALUE_2_CFG,0);
++      FME(REG_PPU_DST_BASE_ADDR,o->aux_scratch ? rkt_resource(o->aux_scratch)->phys_addr : output);FME(REG_PPU_DST_SURF_STRIDE,oh*ow*16);FME(REG_PPU_DATA_FORMAT,oh*ow*16|2);FME(REG_PPU_MISC_CTRL,3);
++      FME(REG_PPU_RDMA_RDMA_CUBE_IN_WIDTH,iw-1);FME(REG_PPU_RDMA_RDMA_CUBE_IN_HEIGHT,ih-1);FME(REG_PPU_RDMA_RDMA_CUBE_IN_CHANNEL,c-1);
++      FME(REG_PPU_RDMA_RDMA_SRC_BASE_ADDR,input);FME(REG_PPU_RDMA_RDMA_SRC_LINE_STRIDE,ipw*16);FME(REG_PPU_RDMA_RDMA_SRC_SURF_STRIDE,iph*ipw*16);FME(REG_PPU_RDMA_RDMA_DATA_FORMAT,2);
++   } else {
++      bool neg=kind==RKT_FLOAT_NEG || kind==RKT_FLOAT_SUB;
++      bool prelu=kind==RKT_FLOAT_PRELU,sigmoid=kind==RKT_FLOAT_SIGMOID,add=kind==RKT_FLOAT_ADD || kind==RKT_FLOAT_MUL || kind==RKT_FLOAT_SUB,mul=kind==RKT_FLOAT_MUL;
++      FME(REG_DPU_S_POINTER,14);FME(REG_DPU_RDMA_RDMA_S_POINTER,14);
++      FME(REG_DPU_FEATURE_MODE_CFG,DPU_FEATURE_MODE_CFG_BURST_LEN(15)|DPU_FEATURE_MODE_CFG_OUTPUT_MODE(2)|DPU_FEATURE_MODE_CFG_FLYING_MODE(1));
++      FME(REG_DPU_DATA_FORMAT,DPU_DATA_FORMAT_OUT_PRECISION(bit_lut ? 1:2)|DPU_DATA_FORMAT_IN_PRECISION(bit_lut ? 1:2)|DPU_DATA_FORMAT_PROC_PRECISION(bit_lut ? 1:2));
++      FME(REG_DPU_OFFSET_PEND,0);FME(REG_DPU_DST_BASE_ADDR,output);FME(REG_DPU_DST_SURF_STRIDE,opw*oph*16);
++      FME(REG_DPU_DATA_CUBE_WIDTH,ow-1);FME(REG_DPU_DATA_CUBE_HEIGHT,oh-1);FME(REG_DPU_DATA_CUBE_CHANNEL,(c-1)|((c-1)<<16));FME(REG_DPU_DATA_CUBE_NOTCH_ADDR,(opw-ow)|((opw-ow)<<16));
++      FME(REG_DPU_BS_CFG,shifted ? DPU_BS_CFG_BS_ALU_ALGO(2)|DPU_BS_CFG_BS_MUL_BYPASS(1)|DPU_BS_CFG_BS_RELU_BYPASS(1) : 0x53);FME(REG_DPU_BS_ALU_CFG,shifted ? (uint32_t)-16384:0);FME(REG_DPU_BS_MUL_CFG,0);FME(REG_DPU_BS_RELUX_CMP_VALUE,0);
++      /* Standalone MRDMA writer uses OD bypass, without convolution SIZE_E. */
++      FME(REG_DPU_BS_OW_CFG,DPU_BS_OW_CFG_OD_BYPASS(1));FME(REG_DPU_BS_OW_OP,0);
++      FME(REG_DPU_WDMA_SIZE_0,c-1);FME(REG_DPU_WDMA_SIZE_1,(ow-1)|((oh-1)<<16));
++      FME(REG_DPU_BN_CFG,neg ? DPU_BN_CFG_BN_ALU_BYPASS(1)|DPU_BN_CFG_BN_RELU_BYPASS(1) : prelu ? 0x62 : sigmoid ? DPU_BN_CFG_BN_ALU_ALGO(2)|DPU_BN_CFG_BN_RELU_BYPASS(1) : 0x53);
++      FME(REG_DPU_BN_ALU_CFG,sigmoid ? 0x80000000 : 0);
++      FME(REG_DPU_BN_MUL_CFG,neg ? DPU_BN_MUL_CFG_BN_MUL_OPERAND(0xbc00) : prelu ? DPU_BN_MUL_CFG_BN_MUL_SRC(1) : sigmoid ? DPU_BN_MUL_CFG_BN_MUL_OPERAND(0x6400) : 0);
++      FME(REG_DPU_BN_RELUX_CMP_VALUE,0);
++      FME(REG_DPU_EW_CFG,add ? DPU_EW_CFG_EW_DATA_MODE(1)|DPU_EW_CFG_EDATA_SIZE(2)|(mul ? DPU_EW_CFG_EW_OP_TYPE(1)|DPU_EW_CFG_EW_OP_CVT_BYPASS(1) : DPU_EW_CFG_EW_ALU_ALGO(2))|DPU_EW_CFG_EW_RELU_BYPASS(1)|DPU_EW_CFG_EW_LUT_BYPASS(1)|DPU_EW_CFG_EW_OP_SRC(1) : bit_lut ? DPU_EW_CFG_EW_RELU_BYPASS(1)|DPU_EW_CFG_EW_OP_CVT_BYPASS(1)|DPU_EW_CFG_EW_OP_BYPASS(1) : sigmoid ? DPU_EW_CFG_EW_RELU_BYPASS(1)|DPU_EW_CFG_EW_OP_CVT_BYPASS(1) : DPU_EW_CFG_EW_RELU_BYPASS(1)|DPU_EW_CFG_EW_OP_CVT_BYPASS(1)|DPU_EW_CFG_EW_LUT_BYPASS(1)|DPU_EW_CFG_EW_OP_BYPASS(1)|DPU_EW_CFG_EW_BYPASS(1));
++      FME(REG_DPU_EW_CVT_OFFSET_VALUE,0);FME(REG_DPU_EW_CVT_SCALE_VALUE,1);FME(REG_DPU_EW_RELUX_CMP_VALUE,0);
++      FME(REG_DPU_OUT_CVT_OFFSET,bit_lut ? 0 : sigmoid ? 1 : 0);FME(REG_DPU_OUT_CVT_SCALE,bit_lut ? 1:0x10001);FME(REG_DPU_OUT_CVT_SHIFT,sigmoid ? DPU_OUT_CVT_SHIFT_CVT_TYPE(1)|DPU_OUT_CVT_SHIFT_MINUS_EXP(15) : 0);
++      FME(REG_DPU_SURFACE_ADD,opw*oph*16);FME(0x40c4,0);
++      if(bit_lut) {
++         /* Treat positive FP16 encodings as integer LUT coordinates and
++          * return FP16 encodings as INT16 output bytes. The table is compiled
++          * once; runtime operands are validated before submission. */
++         unsigned step=shifted ? 32:64;
++         for(unsigned table=0;table<2;table++) {
++            FME(REG_DPU_LUT_ACCESS_CFG,(1<<17)|(table<<16));
++            for(unsigned i=0;i<=512;i++) {
++               unsigned boundary=kind==RKT_FLOAT_RECIPROCAL ? 1024:512;
++               unsigned raw_code=dense ? (table ? boundary+i*64:i*(boundary/512)) : i*step+(shifted ? table*16384:0);
++               uint16_t code=MIN2(raw_code,0x7bff);
++               uint16_t q=MIN2(raw_code,0x7fff);
++                {
++                  _Float16 x;memcpy(&x,&code,2);
++                  _Float16 y=kind==RKT_FLOAT_SQRT ? sqrtf((float)x):kind==RKT_FLOAT_RECIPROCAL ? 1.0f/(float)x:1.0f/sqrtf((float)x);
++                  memcpy(&q,&y,2);
++               }
++               FME(REG_DPU_LUT_ACCESS_DATA,q);
++            }
++         }
++         FME(REG_DPU_LUT_CFG,DPU_LUT_CFG_LUT_HYBRID_PRIORITY(1)|DPU_LUT_CFG_LUT_OFLOW_PRIORITY(1)|DPU_LUT_CFG_LUT_LO_LE_MUX(2));
++         FME(REG_DPU_LUT_INFO,DPU_LUT_INFO_LUT_LE_INDEX_SELECT(dense ? (kind==RKT_FLOAT_RECIPROCAL ? 1:0):shifted ? 5:6)|DPU_LUT_INFO_LUT_LO_INDEX_SELECT(dense ? 6:shifted ? 5:6));
++         FME(REG_DPU_LUT_LE_START,shifted ? (uint32_t)-16384:0);FME(REG_DPU_LUT_LE_END,dense ? (kind==RKT_FLOAT_RECIPROCAL ? 1024:512):shifted ? 0:32768);
++         FME(REG_DPU_LUT_LO_START,dense ? (kind==RKT_FLOAT_RECIPROCAL ? 1024:512):0);FME(REG_DPU_LUT_LO_END,dense ? (kind==RKT_FLOAT_RECIPROCAL ? 33792:33280):shifted ? 16384:32768);
++         FME(REG_DPU_LUT_LE_SLOPE_SCALE,0);FME(REG_DPU_LUT_LE_SLOPE_SHIFT,0);FME(REG_DPU_LUT_LO_SLOPE_SCALE,0);FME(REG_DPU_LUT_LO_SLOPE_SHIFT,0);
++      }
++      if(sigmoid) {
++         for(unsigned table=0;table<2;table++) {
++            FME(REG_DPU_LUT_ACCESS_CFG,(1<<17)|(table<<16));
++            for(unsigned i=0;i<=512;i++) {float x=((int)i-(table ? 0 : 512))*32.0f/1024.0f;unsigned q=CLAMP(lroundf(32768/(1+expf(-x))),0,32767);FME(REG_DPU_LUT_ACCESS_DATA,q);}
++         }
++         FME(REG_DPU_LUT_CFG,DPU_LUT_CFG_LUT_HYBRID_PRIORITY(1)|DPU_LUT_CFG_LUT_OFLOW_PRIORITY(1)|DPU_LUT_CFG_LUT_LO_LE_MUX(2));
++         FME(REG_DPU_LUT_INFO,DPU_LUT_INFO_LUT_LE_INDEX_SELECT(5)|DPU_LUT_INFO_LUT_LO_INDEX_SELECT(5));
++         FME(REG_DPU_LUT_LE_START,0xffffc000);FME(REG_DPU_LUT_LE_END,0);FME(REG_DPU_LUT_LO_START,0);FME(REG_DPU_LUT_LO_END,16384);
++         FME(REG_DPU_LUT_LE_SLOPE_SCALE,0);FME(REG_DPU_LUT_LE_SLOPE_SHIFT,0);FME(REG_DPU_LUT_LO_SLOPE_SCALE,0);FME(REG_DPU_LUT_LO_SLOPE_SHIFT,0);
++      }
++      FME(REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,iw-1);FME(REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,ih-1);FME(REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,c-1);FME(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,input);
++      FME(REG_DPU_RDMA_RDMA_BRDMA_CFG,1);FME(REG_DPU_RDMA_RDMA_BS_BASE_ADDR,0);FME(REG_DPU_RDMA_RDMA_NRDMA_CFG,prelu ? 8 : 1);FME(REG_DPU_RDMA_RDMA_BN_BASE_ADDR,prelu ? rkt_resource(o->conv_prelu)->phys_addr : 0);
++      FME(REG_DPU_RDMA_RDMA_ERDMA_CFG,add ? (1u<<30)|(2<<2) : 1);FME(REG_DPU_RDMA_RDMA_EW_BASE_ADDR,add ? side : 0);FME(REG_DPU_RDMA_RDMA_EW_SURF_STRIDE,add ? ipw*iph*16 : 0);
++      FME(REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,((bit_lut ? 1:2)<<15)|(15<<11)|((bit_lut ? 1:2)<<5)|(bit_lut ? 0:(1<<3))|1|(add ? 4<<8 : 0));
++      FME(REG_DPU_RDMA_RDMA_SRC_DMA_CFG,(ipw-iw)<<19);FME(REG_DPU_RDMA_RDMA_SURF_NOTCH,((iph-ih)*ipw+ipw-iw)*16);FME(REG_DPU_RDMA_RDMA_PAD_CFG,0);FME(REG_DPU_RDMA_RDMA_WEIGHT,0x01010101);FME(REG_DPU_RDMA_RDMA_EW_SURF_NOTCH,0);
++   }
++   util_dynarray_append_typed(regs,uint64_t,0);FME(REG_PC_REGISTER_AMOUNTS,0);util_dynarray_append_typed(regs,uint64_t,0x0041000000000000);
++   util_dynarray_append_typed(regs,uint64_t,((uint64_t)0x81<<48)|((uint64_t)(kind==RKT_FLOAT_MAX_POOL && task_num==0 ? 0x60 : 0x18)<<16)|REG_PC_OPERATION_ENABLE);
++}
++#undef FME
++
++/* A channel sum/mean is a 1x1 convolution with one output channel and
++ * constant weights 1 or 1/C. This uses the already validated FP16 MAC path;
++ * neither dynamic summation nor division runs on the host. Bounded to the
++ * observed channel reductions until spatial packing is separately tested. */
++bool rkt_float_reduce_supported(const struct pipe_ml_operation *p) {
++   const struct pipe_tensor *a=p->input_tensors[0],*b=p->output_tensors[0];
++   if(p->reduce.axis==2 && fp32(a) && fp32(b) &&
++      a->dims[0]==1 && a->dims[1]==1 && a->dims[2]>0 && a->dims[2]<=160 && a->dims[3]>0 && a->dims[3]<=2 &&
++      b->dims[0]==1 && b->dims[1]==1 && b->dims[2]==1 && b->dims[3]==a->dims[3]) return true;
++   if(!fp32(a) || !fp32(b) || p->reduce.axis!=3 ||
++      a->dims[0]!=1 || a->dims[1]!=1 || !a->dims[2] || a->dims[2]>160 ||
++      !a->dims[3] || a->dims[3]>128 || b->dims[3]!=1) return false;
++   for(unsigned d=0;d<3;d++) if(a->dims[d]!=b->dims[d]) return false;
++   return true;
++}
++bool rkt_lower_float_reduce(struct rkt_ml_subgraph *s,const struct pipe_ml_operation *p,struct rkt_operation *o) {
++   if(!rkt_float_reduce_supported(p)) return false;
++   bool spatial=p->reduce.axis==2;
++   unsigned c=p->input_tensors[0]->dims[spatial ? 2:3];float weights[160],bias=0;
++   struct pipe_tensor input=*p->input_tensors[0],output=*p->output_tensors[0];
++   if(spatial) {
++      input.dims[2]=p->input_tensors[0]->dims[3];input.dims[3]=c;
++      output.dims[2]=input.dims[2];output.dims[3]=1;
++   }
++   struct pipe_tensor *inputs[]={&input},*outputs[]={&output};
++   for(unsigned i=0;i<c;i++) weights[i]=p->reduce.mean ? 1.0f/c:1.0f;
++   struct pipe_tensor w={.dims={1,1,1,c},.is_float=true,.type_size=4,.data=(void *)weights};
++   struct pipe_tensor b={.dims={1,1,1,1},.is_float=true,.type_size=4,.data=(void *)&bias};
++   struct pipe_ml_operation conv={.type=PIPE_ML_OPERATION_TYPE_CONVOLUTION,.input_tensors=inputs,.input_count=1,.output_tensors=outputs,.output_count=1};
++   conv.conv.weight_tensor=&w;conv.conv.bias_tensor=&b;conv.conv.stride_x=conv.conv.stride_y=1;
++   conv.conv.pointwise=true;conv.conv.dilation_width_factor=conv.conv.dilation_height_factor=1;
++   if(!rkt_float_conv_supported(&conv)) return false;
++   DBG("NATIVE_REDUCE %s axis=%u channels=%u input=%u output=%u\n",p->reduce.mean ? "mean":"sum",p->reduce.axis,c,p->input_tensors[0]->index,p->output_tensors[0]->index);
++   o->reduce_spatial=spatial;
++   if(!rkt_lower_float_conv(s,&conv,o)) return false;
++   return true;
++}
++
++/* LUT coordinates cover finite nonnegative FP16 encodings. Reciprocal paths
++ * require strictly positive inputs. Reject unsupported values before submit;
++ * never turn NaNs, negative values or zero divisors into plausible outputs. */
++bool rkt_validate_float_domain(struct rkt_ml_subgraph *s, struct rkt_operation *o)
++{
++   if (o->float_aux != RKT_FLOAT_SQRT && o->float_aux != RKT_FLOAT_RSQRT && o->float_aux != RKT_FLOAT_DIV) return true;
++   struct pipe_resource *res = o->float_aux == RKT_FLOAT_DIV ? o->conv_side : o->conv_input;
++   struct pipe_transfer *tr = NULL;
++   const uint16_t *data = pipe_buffer_map(s->context, res, PIPE_MAP_READ, &tr);
++   if (!data) return false;
++   bool valid = true;
++   unsigned h = fp16_extent(o->input_height, o->fp16_global_input);
++   unsigned w = fp16_extent(o->input_width, o->fp16_global_input);
++   for (unsigned y=0; valid && y<o->input_height; y++)
++      for (unsigned x=0; valid && x<o->input_width; x++)
++         for (unsigned c=0; c<o->input_channels; c++) {
++            uint16_t bits = data[cube(h,w,c,y+o->fp16_global_input,x+o->fp16_global_input,8)];
++            if (!rkt_float_lut_input_valid(bits, o->float_aux == RKT_FLOAT_SQRT)) {
++               valid = false;
++               break;
++            }
++         }
++   pipe_buffer_unmap(s->context,tr);
++   if (!valid) {
++      o->error = EDOM;
++      rkt_context(s->context)->error = EDOM;
++      fprintf(stderr,"rocket: unsupported FP16 LUT input domain at tensor %u\n",o->input_index);
++   }
++   return valid;
++}
+--- /dev/null
++++ b/src/gallium/drivers/rocket/rkt_float_ops.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef RKT_FLOAT_CONV_H
++#define RKT_FLOAT_CONV_H
++
++/* Per-tile guards catch output writes outside the expected physical cube. */
++#define FLOAT_GUARD 32768u
++
++bool rkt_lower_float_conv(struct rkt_ml_subgraph *subgraph,
++                          const struct pipe_ml_operation *poperation,
++                          struct rkt_operation *operation);
++void rkt_prepare_float_output(struct rkt_ml_subgraph *,struct rkt_operation *);
++void rkt_check_float_guards(struct rkt_operation *,const uint8_t *);
++void rkt_upload_float_conv(struct rkt_ml_subgraph *subgraph,
++                           struct rkt_operation *operation, const float *input);
++void rkt_read_float_conv(struct rkt_operation *operation,
++                         const uint8_t *raw, float *output);
++void rkt_fill_float_conv_regcmd(struct rkt_ml_subgraph *subgraph,
++                                const struct rkt_operation *operation,
++                                struct util_dynarray *regs, unsigned task_num);
++
++bool rkt_float_conv_supported(const struct pipe_ml_operation *);
++
++bool rkt_float_aux_supported(const struct pipe_ml_operation *);
++bool rkt_lower_float_aux(struct rkt_ml_subgraph *,const struct pipe_ml_operation *,struct rkt_operation *);
++void rkt_upload_float_aux(struct rkt_ml_subgraph *,struct rkt_operation *,const float *);
++void rkt_read_float_aux(struct rkt_operation *,const uint8_t *,float *);
++void rkt_fill_float_aux_regcmd(struct rkt_ml_subgraph *,const struct rkt_operation *,struct util_dynarray *,unsigned);
++
++bool rkt_float_reduce_supported(const struct pipe_ml_operation *);
++bool rkt_lower_float_reduce(struct rkt_ml_subgraph *,const struct pipe_ml_operation *,struct rkt_operation *);
++
++void rkt_check_float_scratch(struct rkt_ml_subgraph *,struct rkt_operation *);
++
++bool rkt_validate_float_domain(struct rkt_ml_subgraph *,struct rkt_operation *);
++
++#endif
+--- /dev/null
++++ b/src/gallium/drivers/rocket/rkt_float_tile_registers.h
+@@ -0,0 +1,133 @@
++/* Captured RK3588 register values for the validated 3x3 stride-2 tile.
++ * Input 17x321x32 FP16; output 8x160x16 FP32; FP32 bias and ReLU.
++ * Used for initialization and ordering. Geometry, precision, activation and
++ * addresses are generated per tile by rkt_fill_float_conv_regcmd.
++ * This is experiment data, not the reference generator implementation. */
++static const uint64_t float_tile_registers[] = {
++   UINT64_C(0x10010000000e4004),
++   UINT64_C(0x20010000000e5004),
++   UINT64_C(0x020100000120100c),
++   UINT64_C(0x0201000001201010),
++   UINT64_C(0x0201000000121014),
++   UINT64_C(0x0201014100111020),
++   UINT64_C(0x0201001f00201024),
++   UINT64_C(0x0201000000a01028),
++   UINT64_C(0x020100000500102c),
++   UINT64_C(0x0201000024001030),
++   UINT64_C(0x0201000002401034),
++   UINT64_C(0x0201030300101038),
++   UINT64_C(0x02010000001b1040),
++   UINT64_C(0x0201000001411044),
++   UINT64_C(0x02010000000b104c),
++   UINT64_C(0x0201000100001050),
++   UINT64_C(0x0201000100001054),
++   UINT64_C(0x0201000100001058),
++   UINT64_C(0x020100010000105c),
++   UINT64_C(0x0201000000001060),
++   UINT64_C(0x0201000000001064),
++   UINT64_C(0x0201000000001068),
++   UINT64_C(0x0201000000001070),
++   UINT64_C(0x0201000000001074),
++   UINT64_C(0x0201000f000f1078),
++   UINT64_C(0x020100000504107c),
++   UINT64_C(0x02010000104d1080),
++   UINT64_C(0x0201014100111084),
++   UINT64_C(0x0201000000201088),
++   UINT64_C(0x0201000000001100),
++   UINT64_C(0x0201000000001104),
++   UINT64_C(0x0201000000001110),
++   UINT64_C(0x0201000000001140),
++   UINT64_C(0x0201000000001144),
++   UINT64_C(0x0201000000001148),
++   UINT64_C(0x020100000000114c),
++   UINT64_C(0x0201000000001150),
++   UINT64_C(0x0201000000001154),
++   UINT64_C(0x0201000000001158),
++   UINT64_C(0x020100000000115c),
++   UINT64_C(0x0201000000001160),
++   UINT64_C(0x0201000000001164),
++   UINT64_C(0x0201000000001168),
++   UINT64_C(0x020100000000116c),
++   UINT64_C(0x0201000000001170),
++   UINT64_C(0x0201000000001174),
++   UINT64_C(0x0201000000001178),
++   UINT64_C(0x020100000000117c),
++   UINT64_C(0x0201000000001180),
++   UINT64_C(0x0201000000001184),
++   UINT64_C(0x0801000002013010),
++   UINT64_C(0x08010007009f3014),
++   UINT64_C(0x08010000000f3018),
++   UINT64_C(0x080100000000301c),
++   UINT64_C(0x0801000000003030),
++   UINT64_C(0x1001000001e4400c),
++   UINT64_C(0x1001a80000024010),
++   UINT64_C(0x1001000000004014),
++   UINT64_C(0x1001000000004020),
++   UINT64_C(0x1001000050004024),
++   UINT64_C(0x10010000009f4030),
++   UINT64_C(0x1001000000074034),
++   UINT64_C(0x1001000000004038),
++   UINT64_C(0x1001000f000f403c),
++   UINT64_C(0x1001000201104040),
++   UINT64_C(0x1001000000004044),
++   UINT64_C(0x1001000000004048),
++   UINT64_C(0x100100000000404c),
++   UINT64_C(0x10010000036e4050),
++   UINT64_C(0x1001000000004054),
++   UINT64_C(0x10010000000f4058),
++   UINT64_C(0x10010007009f405c),
++   UINT64_C(0x1001000000534060),
++   UINT64_C(0x1001000000004064),
++   UINT64_C(0x1001000000004068),
++   UINT64_C(0x100100000000406c),
++   UINT64_C(0x1001000003834070),
++   UINT64_C(0x1001000000004074),
++   UINT64_C(0x1001000000014078),
++   UINT64_C(0x100100000000407c),
++   UINT64_C(0x1001000000004080),
++   UINT64_C(0x1001000000014084),
++   UINT64_C(0x1001000000004088),
++   UINT64_C(0x1001000000004090),
++   UINT64_C(0x1001000000004094),
++   UINT64_C(0x1001000000004098),
++   UINT64_C(0x100100000000409c),
++   UINT64_C(0x10010000000040a0),
++   UINT64_C(0x10010000000040a4),
++   UINT64_C(0x10010000000040a8),
++   UINT64_C(0x10010000000040ac),
++   UINT64_C(0x10010001400040c0),
++   UINT64_C(0x10010000000040c4),
++   UINT64_C(0x1001000000004100),
++   UINT64_C(0x1001000000004104),
++   UINT64_C(0x1001000000004108),
++   UINT64_C(0x100100000000410c),
++   UINT64_C(0x1001000000004110),
++   UINT64_C(0x1001000000004114),
++   UINT64_C(0x1001000000004118),
++   UINT64_C(0x100100000000411c),
++   UINT64_C(0x1001000000004120),
++   UINT64_C(0x1001000000004124),
++   UINT64_C(0x1001000000004128),
++   UINT64_C(0x100100000000412c),
++   UINT64_C(0x20010000009f500c),
++   UINT64_C(0x2001000000075010),
++   UINT64_C(0x20010000000f5014),
++   UINT64_C(0x2001000000005018),
++   UINT64_C(0x200100000002501c),
++   UINT64_C(0x2001000000005020),
++   UINT64_C(0x2001000000005028),
++   UINT64_C(0x200100000000502c),
++   UINT64_C(0x2001000000015034),
++   UINT64_C(0x2001000000005038),
++   UINT64_C(0x2001000000005040),
++   UINT64_C(0x2001000178505044),
++   UINT64_C(0x2001000000005048),
++   UINT64_C(0x200100000000504c),
++   UINT64_C(0x2001000000005064),
++   UINT64_C(0x2001010101015068),
++   UINT64_C(0x200100000000506c),
++   UINT64_C(0x0000000000000000),
++   UINT64_C(0x0101000000000014),
++   UINT64_C(0x0041000000000000),
++   UINT64_C(0x00810000001d0008),
++};
+--- a/src/gallium/drivers/rocket/rkt_ml.c
++++ b/src/gallium/drivers/rocket/rkt_ml.c
+@@ -14,8 +14,10 @@
+ 
+ #include "rkt_coefs.h"
+ #include "rkt_ml.h"
++#include <errno.h>
+ #include "rkt_regcmd.h"
+ #include "rkt_task.h"
++#include "rkt_float_ops.h"
+ 
+ void
+ rkt_dump_buffer(const uint8_t *ptr, char *name, int operation_nr,
+@@ -49,8 +51,11 @@
+    struct pipe_resource *res = tensors[idx];
+ 
+    if (res != NULL) {
+-      assert(size == pipe_buffer_size(res));
+-      return;
++      if (pipe_buffer_size(res) >= size)
++         return;
++      /* All tensors are sized before commands are compiled. A depthwise
++       * consumer may require a larger padded cube than its producer. */
++      pipe_resource_reference(&tensors[idx], NULL);
+    }
+ 
+    res = pipe_buffer_create(context->screen, 0, PIPE_USAGE_DEFAULT, size);
+@@ -79,7 +84,7 @@
+ calc_raw_input_size(struct rkt_operation *operation)
+ {
+    unsigned input_channels_1 =
+-      DIV_ROUND_UP(operation->input_channels, FEATURE_ATOMIC_SIZE) * 2;
++      rkt_input_storage_channels(operation) / FEATURE_ATOMIC_SIZE * 2;
+    unsigned input_channels_2 = FEATURE_ATOMIC_SIZE;
+ 
+    return operation->input_width * operation->input_height *
+@@ -90,7 +95,7 @@
+ calc_raw_output_size(struct rkt_operation *operation)
+ {
+    unsigned output_channels_1 =
+-      DIV_ROUND_UP(operation->output_channels, FEATURE_ATOMIC_SIZE) * 2;
++      rkt_output_storage_channels(operation) / FEATURE_ATOMIC_SIZE * 2;
+    unsigned output_channels_2 = FEATURE_ATOMIC_SIZE;
+ 
+    return operation->output_width * operation->output_height *
+@@ -109,6 +114,7 @@
+       util_dynarray_num_elements(&operation->tasks, struct split_task);
+ 
+    regcfgs = calloc(num_tasks, sizeof(struct util_dynarray));
++   if (!regcfgs) { rkt_context(pcontext)->error=ENOMEM; return; }
+ 
+    for (int i = 0; i < num_tasks; i++) {
+       regcfgs[i] = UTIL_DYNARRAY_INIT;
+@@ -121,16 +127,18 @@
+ 
+    operation->regcmd = pipe_buffer_create(pcontext->screen, 0,
+                                           PIPE_USAGE_DEFAULT, regcfg_total_size);
++   if (!operation->regcmd) { rkt_context(pcontext)->error=ENOMEM; goto fail_regcfg; }
+    uint8_t *regcmd =
+       pipe_buffer_map(pcontext, operation->regcmd, PIPE_MAP_WRITE, &transfer);
+ 
++   if (!regcmd) goto fail_regcfg;
+    unsigned regcmd_offset = 0;
+    for (int i = 0; i < num_tasks; i++) {
+       unsigned size = util_dynarray_num_elements(&regcfgs[i], uint64_t);
+       struct split_task *task =
+          util_dynarray_element(&operation->tasks, struct split_task, i);
+ 
+-      if (i < num_tasks - 1) {
++      if (i < num_tasks - 1 && !operation->float_conv_f16 && !operation->float_aux) {
+          /* Patch next address and amount of regs to fetch, positions are relative
+           * to end */
+          unsigned reg_count = util_dynarray_num_elements(&regcfgs[i], uint64_t);
+@@ -159,8 +167,8 @@
+          rkt_resource(operation->regcmd)->phys_addr + regcmd_offset;
+ 
+       if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
+-         rkt_dump_buffer(regcmd, "regcmd", 0, i, regcmd_offset,
+-                         (size + 4) * sizeof(uint64_t));
++         rkt_dump_buffer(regcmd, "regcmd", operation->output_index, i, regcmd_offset,
++                         size * sizeof(uint64_t));
+ 
+       regcmd_offset += align(size * sizeof(uint64_t), 64);
+    }
+@@ -172,6 +180,11 @@
+    }
+ 
+    free(regcfgs);
++   return;
++fail_regcfg:
++   for (unsigned i=0;i<num_tasks;i++) util_dynarray_fini(&regcfgs[i]);
++   free(regcfgs);
++
+ }
+ 
+ static void
+@@ -182,6 +195,8 @@
+    operation->tasks = UTIL_DYNARRAY_INIT;
+ 
+    operation->depthwise = rkt_is_depthwise(poperation);
++   operation->relu = poperation->conv.relu;
++   operation->per_axis = poperation->conv.weight_tensor->scales != NULL;
+    operation->padding_top = poperation->conv.padding_top;
+    operation->padding_bottom = poperation->conv.padding_bottom;
+    operation->padding_left = poperation->conv.padding_left;
+@@ -192,24 +207,127 @@
+    operation->input_width = poperation->input_tensors[0]->dims[1];
+    operation->input_height = poperation->input_tensors[0]->dims[2];
+    operation->input_channels = poperation->input_tensors[0]->dims[3];
+-   operation->input_zero_point = poperation->input_tensors[0]->zero_point;
++   /* The register/task helpers use zero-points in the unsigned 8-bit domain.
++    * Keep signed tensors' bytes signed, but normalize their zero-points. */
++   operation->input_zero_point = poperation->input_tensors[0]->zero_point +
++                                 (poperation->input_tensors[0]->is_signed ? 128 : 0);
+    operation->input_scale = poperation->input_tensors[0]->scale;
+ 
+    operation->output_index = poperation->output_tensors[0]->index;
+    operation->output_width = poperation->output_tensors[0]->dims[1];
+    operation->output_height = poperation->output_tensors[0]->dims[2];
+    operation->output_channels = poperation->output_tensors[0]->dims[3];
+-   operation->output_zero_point = poperation->output_tensors[0]->zero_point;
++   operation->output_zero_point = poperation->output_tensors[0]->zero_point +
++                                  (poperation->output_tensors[0]->is_signed ? 128 : 0);
+    operation->output_scale = poperation->output_tensors[0]->scale;
+ 
+    operation->weights_width = poperation->conv.weight_tensor->dims[1];
+    operation->weights_height = poperation->conv.weight_tensor->dims[2];
+-   operation->weights_zero_point = poperation->conv.weight_tensor->zero_point;
++   operation->weights_zero_point = poperation->conv.weight_tensor->zero_point +
++                                   (poperation->conv.weight_tensor->is_signed ? 128 : 0);
+    operation->weights_scale = poperation->conv.weight_tensor->scale;
+ 
+    operation->weights = rkt_fill_weights(subgraph, poperation);
+-   operation->biases =
++   if (!operation->weights) { rkt_context(subgraph->context)->error=ENOMEM; return; }
++   double head_scale = (double)operation->input_scale * operation->weights_scale /
++                       operation->output_scale;
++   int head_exponent = 0;
++   int64_t head_multiplier = 0;
++   bool head_double = !operation->per_axis &&
++                      operation->output_channels == 1 && !operation->relu &&
++                      poperation->input_tensors[0]->is_signed &&
++                      poperation->output_tensors[0]->is_signed &&
++                      poperation->conv.weight_tensor->is_signed &&
++                      poperation->conv.weight_tensor->zero_point == 0 &&
++                      isfinite(head_scale) && head_scale > 0 && head_scale < 0.5;
++   if (head_double) {
++      head_multiplier = llround(ldexp(frexp(head_scale, &head_exponent), 31));
++      if (head_multiplier == (1LL << 31)) {
++         head_multiplier /= 2;
++         head_exponent++;
++      }
++      head_double = head_exponent >= -31 && head_exponent <= -1 &&
++                    head_multiplier <= 2LL * 32767 * 32767;
++   }
++   if (head_double) {
++      struct pipe_ml_operation copy = *poperation;
++      struct pipe_tensor weights = *poperation->conv.weight_tensor;
++      float channel_scale = weights.scale;
++      weights.scales = &channel_scale;
++      copy.conv.weight_tensor = &weights;
++      operation->per_axis = true;
++      operation->biases = rkt_fill_peraxis(subgraph, &copy, operation);
++      return;
++   }
++   operation->biases = operation->per_axis ?
++      rkt_fill_peraxis(subgraph, poperation, operation) :
+       rkt_fill_biases(subgraph, poperation, &operation->truncate_bits);
++}
++
++/* Nearest x2 is a direct INT8 transposed convolution with diagonal 2x2
++ * unit weights. Operate on raw signed codes: no requantization is needed. */
++static void
++lower_resize(struct rkt_ml_subgraph *sg, const struct pipe_ml_operation *p,
++             struct rkt_operation *op)
++{
++   unsigned channels = p->input_tensors[0]->dims[3];
++   int8_t *weights = calloc(channels * channels * 4, 1);
++   int32_t *biases = calloc(channels, sizeof(int32_t));
++   for (unsigned c = 0; c < channels; c++)
++      for (unsigned k = 0; k < 4; k++)
++         weights[(c * 4 + k) * channels + c] = 1;
++   struct pipe_tensor in = *p->input_tensors[0], out = *p->output_tensors[0];
++   in.scale = out.scale = 1;
++   in.zero_point = out.zero_point = 0;
++   struct pipe_tensor wt = { .dims = {channels, 2, 2, channels},
++      .is_signed = true, .type_size = 1, .scale = 1, .data = (uint8_t *)weights };
++   struct pipe_tensor bt = { .dims = {1, 1, 1, channels},
++      .is_signed = true, .type_size = 4, .scale = 1, .data = (uint8_t *)biases };
++   struct pipe_tensor *inputs[] = {&in}, *outputs[] = {&out};
++   struct pipe_ml_operation conv = {0};
++   conv.type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
++   conv.input_tensors = inputs; conv.output_tensors = outputs;
++   conv.conv.weight_tensor = &wt; conv.conv.bias_tensor = &bt;
++   conv.conv.stride_x = conv.conv.stride_y = 1;
++   conv.conv.padding_top = conv.conv.padding_left = 1;
++   conv.conv.padding_bottom = conv.conv.padding_right = 1;
++   lower_convolution(sg, &conv, op);
++   op->deconv = true;
++   free(weights); free(biases);
++}
++
++static void
++lower_tensor_shape(const struct pipe_ml_operation *p, struct rkt_operation *op)
++{
++   const struct pipe_tensor *in = p->input_tensors[0], *out = p->output_tensors[0];
++   op->tasks = UTIL_DYNARRAY_INIT;
++   op->input_index = in->index;
++   op->input_width = in->dims[2];
++   op->input_height = in->dims[1];
++   op->input_channels = in->dims[3];
++   op->input_zero_point = in->zero_point + (in->is_signed ? 128 : 0);
++   op->input_scale = in->scale;
++   op->output_index = out->index;
++   op->output_width = out->dims[2];
++   op->output_height = out->dims[1];
++   op->output_channels = out->dims[3];
++   op->output_zero_point = out->zero_point + (out->is_signed ? 128 : 0);
++   op->output_scale = out->scale;
++}
++
++static void
++lower_pooling(const struct pipe_ml_operation *p, struct rkt_operation *op)
++{
++   lower_tensor_shape(p, op);
++   op->pooling = true;
++   op->pool_width = p->pooling.filter_width;
++   op->pool_height = p->pooling.filter_height;
++   op->stride = p->pooling.stride_x;
++   op->pool_stride_y = p->pooling.stride_y;
++   op->padding_left = p->pooling.padding_left;
++   op->padding_top = p->pooling.padding_top;
++   op->padding_right = p->pooling.padding_right;
++   op->padding_bottom = p->pooling.padding_bottom;
+ }
+ 
+ static struct rkt_operation *
+@@ -217,7 +335,8 @@
+ {
+    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+                           operation) {
+-      if (operation->input_index == tensor_index)
++      if (operation->input_index == tensor_index ||
++          (operation->add_tensor == (int)tensor_index))
+          return operation;
+    }
+ 
+@@ -252,8 +371,25 @@
+          tensor_count = MAX2(tensor_count, poperation->conv.weight_tensor->index);
+          tensor_count = MAX2(tensor_count, poperation->conv.bias_tensor->index);
+          break;
++      case PIPE_ML_OPERATION_TYPE_LEAKY_RELU:
++      case PIPE_ML_OPERATION_TYPE_CONCATENATION:
++      case PIPE_ML_OPERATION_TYPE_MUL:
++      case PIPE_ML_OPERATION_TYPE_SUBTRACT:
++      case PIPE_ML_OPERATION_TYPE_SQUARED_DIFFERENCE:
++      case PIPE_ML_OPERATION_TYPE_DIV:
+       case PIPE_ML_OPERATION_TYPE_ADD:
+          tensor_count = MAX2(tensor_count, poperation->input_tensors[1]->index);
++         break;
++      case PIPE_ML_OPERATION_TYPE_PAD:
++      case PIPE_ML_OPERATION_TYPE_POOLING:
++      case PIPE_ML_OPERATION_TYPE_RESHAPE:
++      case PIPE_ML_OPERATION_TYPE_LOGISTIC:
++      case PIPE_ML_OPERATION_TYPE_RESIZE:
++      case PIPE_ML_OPERATION_TYPE_REDUCE:
++      case PIPE_ML_OPERATION_TYPE_SQRT:
++      case PIPE_ML_OPERATION_TYPE_RSQRT:
++      case PIPE_ML_OPERATION_TYPE_NEG:
++      case PIPE_ML_OPERATION_TYPE_STRIDED_SLICE:
+          break;
+       default:
+          DBG("poperation->type %d\n", poperation->type);
+@@ -279,18 +415,45 @@
+                            const struct pipe_ml_operation *operation)
+ {
+    bool supported = false;
++   if(operation->type==PIPE_ML_OPERATION_TYPE_REDUCE) return rkt_float_reduce_supported(operation);
++   if (operation->input_tensors[0]->is_float &&
++       operation->type != PIPE_ML_OPERATION_TYPE_CONVOLUTION)
++      return rkt_float_aux_supported(operation);
++
++
++   if (operation->input_tensors[0]->is_float && operation->type == PIPE_ML_OPERATION_TYPE_CONVOLUTION)
++      return rkt_float_conv_supported(operation);
+ 
+    switch (operation->type) {
++   case PIPE_ML_OPERATION_TYPE_LEAKY_RELU: {
++      if (operation->input_count != 2 || operation->output_count != 1) return false;
++      const struct pipe_tensor *in=operation->input_tensors[0], *alpha=operation->input_tensors[1], *out=operation->output_tensors[0];
++      if (!in->is_float || !alpha->is_float || !out->is_float || in->type_size!=4 || alpha->type_size!=4 || out->type_size!=4 || !alpha->data) return false;
++      for (int k=0;k<4;k++) if(in->dims[k]!=out->dims[k]) return false;
++      return alpha->dims[0]==1 && alpha->dims[1]==1 && alpha->dims[2]==1 && alpha->dims[3]==in->dims[3];
++   }
+    case PIPE_ML_OPERATION_TYPE_CONVOLUTION: {
+       struct pipe_tensor *input_tensor = operation->input_tensors[0];
+       struct pipe_tensor *weight_tensor = operation->conv.weight_tensor;
+       struct pipe_tensor *bias_tensor = operation->conv.bias_tensor;
+       struct pipe_tensor *output_tensor = operation->output_tensors[0];
+ 
+-      // Dilation and per-axis quantization not yet implemented
+-      if (tensor_quantization_supported(input_tensor) &&
+-          tensor_quantization_supported(weight_tensor) &&
+-          tensor_quantization_supported(bias_tensor) &&
++      bool per_axis_supported = false;
++      if (weight_tensor->scales &&
++          weight_tensor->is_signed && weight_tensor->zero_points &&
++          bias_tensor->type_size == 4) {
++         per_axis_supported = true;
++         for (unsigned c = 0; c < output_tensor->dims[3]; c++)
++            if (weight_tensor->zero_points[c] != 0 ||
++                !isfinite(weight_tensor->scales[c]) || weight_tensor->scales[c] <= 0)
++               per_axis_supported = false;
++      }
++      // Per-axis support remains an opt-in diagnostic until validated.
++      if (input_tensor->type_size == 1 && weight_tensor->type_size == 1 &&
++          output_tensor->type_size == 1 &&
++          tensor_quantization_supported(input_tensor) &&
++          (per_axis_supported || (tensor_quantization_supported(weight_tensor) &&
++                                  tensor_quantization_supported(bias_tensor))) &&
+           tensor_quantization_supported(output_tensor) &&
+           operation->conv.dilation_width_factor == 1 &&
+           operation->conv.dilation_height_factor == 1)
+@@ -298,16 +461,118 @@
+ 
+       break;
+    }
++   case PIPE_ML_OPERATION_TYPE_PAD: {
++      struct pipe_tensor *in = operation->input_tensors[0], *out = operation->output_tensors[0];
++      supported = in->is_signed && out->is_signed &&
++         in->type_size == 1 && out->type_size == 1 && !in->scales && !out->scales &&
++         in->scale == out->scale && in->zero_point == out->zero_point &&
++         in->dims[0] == 1 && out->dims[0] == 1 && in->dims[1] == 640 && in->dims[2] == 640 &&
++         out->dims[1] == 642 && out->dims[2] == 642 && in->dims[3] == 3 && out->dims[3] == 3 &&
++         operation->pad.before_x == 1 && operation->pad.after_x == 1 &&
++         operation->pad.before_y == 1 && operation->pad.after_y == 1 &&
++         operation->pad.before_z == 0 && operation->pad.after_z == 0;
++      break;
++   }
++   case PIPE_ML_OPERATION_TYPE_RESHAPE: {
++      struct pipe_tensor *in = operation->input_tensors[0], *out = operation->output_tensors[0];
++      supported = in->is_signed && out->is_signed &&
++         in->type_size == 1 && out->type_size == 1 && !in->scales && !out->scales &&
++         in->scale == out->scale && in->zero_point == out->zero_point &&
++         in->dims[0] == 1 && out->dims[0] == 1 && out->dims[1] == 1 &&
++         out->dims[2] == in->dims[1] * in->dims[2] && out->dims[3] == in->dims[3] &&
++         in->dims[1] == in->dims[2];
++      break;
++   }
++   case PIPE_ML_OPERATION_TYPE_LOGISTIC: {
++      struct pipe_tensor *in = operation->input_tensors[0], *out = operation->output_tensors[0];
++      supported = in->is_signed && out->is_signed &&
++         in->type_size == 1 && out->type_size == 1 && !in->scales && !out->scales &&
++         in->dims[0] == 1 && in->dims[3] == 1 && in->dims[1] == in->dims[2] &&
++         in->dims[1] <= 80 && !memcmp(in->dims, out->dims, sizeof(in->dims)) &&
++         in->scale > 0 && out->scale == 1.0f/256 && out->zero_point == -128;
++      break;
++   }
++   case PIPE_ML_OPERATION_TYPE_RESIZE: {
++      const struct pipe_tensor *in = operation->input_tensors[0], *out = operation->output_tensors[0];
++      supported = in->is_signed && out->is_signed &&
++         in->type_size == 1 && out->type_size == 1 && !in->scales && !out->scales &&
++         in->scale == out->scale && in->zero_point == out->zero_point &&
++         in->dims[0] == 1 && out->dims[0] == 1 && in->dims[1] == in->dims[2] &&
++         out->dims[1] == 2 * in->dims[1] && out->dims[2] == 2 * in->dims[2] &&
++         in->dims[3] == 64 && out->dims[3] == 64 && in->dims[1] <= 40;
++      break;
++   }
++   case PIPE_ML_OPERATION_TYPE_POOLING: {
++      const struct pipe_tensor *in = operation->input_tensors[0];
++      const struct pipe_tensor *out = operation->output_tensors[0];
++      supported = operation->pooling.type == PIPE_ML_POOLING_TYPE_MAX &&
++         operation->pooling.filter_width == 2 && operation->pooling.filter_height == 2 &&
++         operation->pooling.stride_x == 2 && operation->pooling.stride_y == 2 &&
++         !operation->pooling.padding_left && !operation->pooling.padding_right &&
++         !operation->pooling.padding_top && !operation->pooling.padding_bottom &&
++         in->dims[1] == 2 * out->dims[1] && in->dims[2] == 2 * out->dims[2] &&
++         in->type_size == 1 && out->type_size == 1 &&
++         in->is_signed == out->is_signed && in->scale == out->scale &&
++         in->zero_point == out->zero_point &&
++         in->dims[0] == 1 && out->dims[0] == 1 && in->dims[3] == out->dims[3] &&
++         in->dims[3] % 16 == 0 && in->dims[1] == in->dims[2] &&
++         out->dims[1] == out->dims[2] && !in->scales && !out->scales &&
++         operation->pooling.filter_width > 0 && operation->pooling.filter_width <= 16 &&
++         operation->pooling.filter_height > 0 && operation->pooling.filter_height <= 16 &&
++         operation->pooling.stride_x > 0 && operation->pooling.stride_x <= 16 &&
++         operation->pooling.stride_y > 0 && operation->pooling.stride_y <= 16 &&
++         operation->pooling.padding_left < 8 && operation->pooling.padding_right < 8 &&
++         operation->pooling.padding_top < 8 && operation->pooling.padding_bottom < 8;
++      break;
++   }
+    case PIPE_ML_OPERATION_TYPE_ADD:
+-      supported = operation->input_tensors[0]->data == NULL &&
+-                  operation->input_tensors[1]->data == NULL;
+-      break;
++       {
++         struct pipe_tensor *a = operation->input_tensors[0], *b = operation->input_tensors[1];
++         struct pipe_tensor *out = operation->output_tensors[0];
++         supported = a->is_signed && b->is_signed && out->is_signed &&
++            a->type_size == 1 && b->type_size == 1 && out->type_size == 1 &&
++            !a->scales && !b->scales && !out->scales && !a->data && !b->data &&
++            !operation->add.relu && a->dims[0] == 1 && a->dims[3] == 64 &&
++            a->dims[1] == a->dims[2] && a->dims[1] <= 80 &&
++            !memcmp(a->dims, b->dims, sizeof(a->dims)) &&
++            !memcmp(a->dims, out->dims, sizeof(a->dims)) &&
++            a->scale > 0 && b->scale > 0 && a->scale / out->scale <= 32767.0f/32768 &&
++            b->scale / out->scale <= 32767.0f/32768;
++         break;
++      }
+    default:
+       supported = false;
+    }
+ 
+    return supported;
+ }
++
++
++/* Check the native FP16 C8 layout, tile geometry and allocation boundaries
++ * before considering any producer/consumer buffer alias. */
++static bool
++native_link_compatible(const struct rkt_operation *p, const struct rkt_operation *c)
++{
++   if (!p || p->fp16_global || c->fp16_global || !p->float_conv_f16 || !p->depthwise || !c->float_conv_f16 || c->depthwise ||
++       c->weights_width != 1 || c->weights_height != 1 || c->stride != 1 ||
++       c->padding_top || c->padding_left ||
++       p->output_index != c->input_index || p->output_height != c->input_height ||
++       p->output_width != c->input_width || p->output_channels != c->input_channels ||
++       p->conv_physical_oc != c->conv_physical_ic || p->conv_output_bytes != c->conv_input_bytes)
++      return false;
++   unsigned count=util_dynarray_num_elements(&p->tasks,struct split_task);
++   if (count != util_dynarray_num_elements(&c->tasks,struct split_task)) return false;
++   for (unsigned i=0;i<count;i++) {
++      const struct split_task *a=util_dynarray_element(&p->tasks,struct split_task,i);
++      const struct split_task *b=util_dynarray_element(&c->tasks,struct split_task,i);
++      if (a->conv_x != b->conv_x || a->conv_y != b->conv_y ||
++          a->output_height != b->input_height || a->output_width != b->input_width ||
++          a->conv_output_bytes != b->conv_input_bytes || a->output_offset != b->input_offset)
++         return false;
++   }
++   return true;
++}
++
+ 
+ struct pipe_ml_subgraph *
+ rkt_ml_subgraph_create(struct pipe_ml_device *pdevice,
+@@ -322,9 +587,19 @@
+    if (!dev->context)
+       dev->context = screen->pscreen.context_create(&screen->pscreen, NULL, 0);
+ 
++   if (!dev->context) return NULL;
+    subgraph = calloc(1, sizeof(*subgraph));
++   if (!subgraph) return NULL;
+    subgraph->base.device = pdevice;
+    subgraph->context = dev->context;
++   subgraph->float_pipeline = count && poperations[0].input_tensors[0]->is_float;
++   for (unsigned i = 0; i < count; i++) {
++      if (poperations[i].input_tensors[0]->is_float != subgraph->float_pipeline) {
++         fprintf(stderr, "rocket: mixed float/quantized partition is unsupported\n");
++         free(subgraph);
++         return NULL;
++      }
++   }
+ 
+    tensor_count = count_tensors(poperations, count);
+    subgraph->tensors = UTIL_DYNARRAY_INIT;
+@@ -338,38 +613,144 @@
+    for (int i = 0; i < count; i++) {
+       struct rkt_operation operation = {0};
+       operation.add_tensor = -1;
+-
++      if(poperations[i].type==PIPE_ML_OPERATION_TYPE_REDUCE) {
++         if(!rkt_lower_float_reduce(subgraph,&poperations[i],&operation)) {rkt_ml_subgraph_destroy(pdevice,&subgraph->base);return NULL;}
++         util_dynarray_append(&subgraph->operations,operation);continue;
++      }
++
++
++      if (poperations[i].input_tensors[0]->is_float &&
++          (poperations[i].type == PIPE_ML_OPERATION_TYPE_PAD ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_POOLING ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_RESHAPE ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_LOGISTIC ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_CONCATENATION ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_MUL ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_SQRT ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_RSQRT ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_STRIDED_SLICE ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_DIV ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_NEG ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_SUBTRACT ||
++           poperations[i].type == PIPE_ML_OPERATION_TYPE_SQUARED_DIFFERENCE)) {
++         if (!rkt_lower_float_aux(subgraph, &poperations[i], &operation)) {
++            rkt_ml_subgraph_destroy(pdevice, &subgraph->base);
++            return NULL;
++         }
++         util_dynarray_append(&subgraph->operations, operation);
++         continue;
++      }
+       switch (poperations[i].type) {
++      case PIPE_ML_OPERATION_TYPE_LEAKY_RELU: {
++         const struct pipe_ml_operation *p=&poperations[i];
++         struct rkt_operation *producer=find_producer(subgraph,p->input_tensors[0]->index);
++         /* ADD is EW, after BN: PReLU cannot be fused into that hardware
++          * pass. Retain the FP16 ADD cube and run a second DPU task in the
++          * same job instead of converting it through a host tensor. */
++         if(producer && producer->float_aux==RKT_FLOAT_ADD && !producer->conv_prelu) {
++            producer->conv_prelu=pipe_buffer_create(subgraph->context->screen,0,PIPE_USAGE_DEFAULT,producer->conv_physical_ic*2+256);
++            producer->aux_scratch=pipe_buffer_create(subgraph->context->screen,0,PIPE_USAGE_DEFAULT,pipe_buffer_size(producer->conv_output));
++            if(!producer->conv_prelu || !producer->aux_scratch) {rkt_ml_subgraph_destroy(pdevice,&subgraph->base);return NULL;}
++            struct pipe_transfer *tr=NULL;
++            _Float16 *dst=pipe_buffer_map(subgraph->context,producer->conv_prelu,PIPE_MAP_WRITE,&tr);if(!dst) { rkt_ml_subgraph_destroy(pdevice, &subgraph->base); return NULL; }
++            memset(dst,0,pipe_buffer_size(producer->conv_prelu));const float *alpha=(const void *)p->input_tensors[1]->data;
++            for(unsigned c=0;c<producer->input_channels;c++) dst[c]=(_Float16)alpha[c];
++            pipe_buffer_unmap(subgraph->context,tr);
++            struct split_task t={0};util_dynarray_append(&producer->tasks,t);
++            DBG("NATIVE_ADD_PRELU input=%u output=%u two_DPU_tasks\n",producer->output_index,p->output_tensors[0]->index);
++            producer->output_index=p->output_tensors[0]->index;
++            break;
++         }
++         if ((!producer || !producer->float_conv_f16 || producer->depthwise)) {
++            if (!rkt_lower_float_aux(subgraph,p,&operation)) { rkt_ml_subgraph_destroy(pdevice,&subgraph->base); return NULL; }
++            util_dynarray_append(&subgraph->operations,operation);
++            break;
++         }
++         if (!producer || !producer->float_conv_f16 || producer->depthwise || producer->conv_prelu) {
++            fprintf(stderr,"rocket: unsupported PReLU fusion\n");rkt_ml_subgraph_destroy(pdevice,&subgraph->base);return NULL;
++         }
++         producer->conv_prelu=pipe_buffer_create(subgraph->context->screen,0,PIPE_USAGE_DEFAULT,producer->conv_physical_oc*2+256);
++         if (!producer->conv_prelu) {rkt_ml_subgraph_destroy(pdevice,&subgraph->base);return NULL;}
++         struct pipe_transfer *tr=NULL;
++         _Float16 *dst=pipe_buffer_map(subgraph->context,producer->conv_prelu,PIPE_MAP_WRITE,&tr);
++         if(!dst) {rkt_ml_subgraph_destroy(pdevice,&subgraph->base);return NULL;}
++         memset(dst,0,pipe_buffer_size(producer->conv_prelu));
++         const float *alpha=(const void *)p->input_tensors[1]->data;
++         for(unsigned c=0;c<producer->output_channels;c++) dst[c]=(_Float16)alpha[c];
++         pipe_buffer_unmap(subgraph->context,tr);
++         DBG("FUSED_PRELU input=%u output=%u channels=%u\n",producer->output_index,p->output_tensors[0]->index,producer->output_channels);
++         producer->output_index=p->output_tensors[0]->index;
++         break;
++      }
+       case PIPE_ML_OPERATION_TYPE_CONVOLUTION:
++         if (poperations[i].input_tensors[0]->is_float) {
++            if (!rkt_lower_float_conv(subgraph, &poperations[i], &operation)) {
++               fprintf(stderr, "rocket: float convolution requires a supported convolution operation\n");
++               rkt_ml_subgraph_destroy(pdevice, &subgraph->base);
++               return NULL;
++            }
++            util_dynarray_append(&subgraph->operations, operation);
++            break;
++         }
++         if (poperations[i].input_tensors[0]->type_size != 1 ||
++             poperations[i].conv.weight_tensor->type_size != 1 ||
++             poperations[i].output_tensors[0]->type_size != 1) {
++            fprintf(stderr, "rocket: refusing convolution %d: input/weights/output "
++                    "element bytes %u/%u/%u; current convolution lowering requires 8-bit tensors\n",
++                    i, poperations[i].input_tensors[0]->type_size,
++                    poperations[i].conv.weight_tensor->type_size,
++                    poperations[i].output_tensors[0]->type_size);
++            rkt_ml_subgraph_destroy(pdevice, &subgraph->base);
++            return NULL;
++         }
+          lower_convolution(subgraph, &poperations[i], &operation);
+          util_dynarray_append(&subgraph->operations, operation);
+          break;
++      case PIPE_ML_OPERATION_TYPE_RESIZE:
++         lower_resize(subgraph, &poperations[i], &operation);
++         util_dynarray_append(&subgraph->operations, operation);
++         break;
++      case PIPE_ML_OPERATION_TYPE_PAD:
++         lower_tensor_shape(&poperations[i], &operation);
++         operation.pad_copy = true;
++         operation.padding_top = operation.padding_left = 1;
++         util_dynarray_append(&subgraph->operations, operation);
++         break;
++      case PIPE_ML_OPERATION_TYPE_RESHAPE:
++         lower_tensor_shape(&poperations[i], &operation);
++         operation.reshape = true;
++         operation.output_width = operation.input_width;
++         operation.output_height = operation.input_height;
++         util_dynarray_append(&subgraph->operations, operation);
++         break;
++      case PIPE_ML_OPERATION_TYPE_LOGISTIC:
++         lower_tensor_shape(&poperations[i], &operation);
++         operation.logistic = true;
++         util_dynarray_append(&subgraph->operations, operation);
++         break;
++      case PIPE_ML_OPERATION_TYPE_POOLING:
++         lower_pooling(&poperations[i], &operation);
++         util_dynarray_append(&subgraph->operations, operation);
++         break;
+       case PIPE_ML_OPERATION_TYPE_ADD: {
+-         /* Fuse tensor addition into convolution*/
+-         struct rkt_operation *input_op_1 =
+-            find_producer(subgraph, poperations[i].input_tensors[1]->index);
+-         struct rkt_operation *input_op_2 =
+-            find_producer(subgraph, poperations[i].input_tensors[0]->index);
+-
+-         assert(input_op_2);
+-
+-         if (input_op_1 == NULL) {
+-            /* Graph input */
+-            input_op_2->add_tensor = poperations[i].input_tensors[1]->index;
+-         } else {
+-            input_op_1->addition_input = true;
+-            input_op_2->add_tensor = input_op_1->output_index;
+-         }
+-
+-         input_op_2->output_index = poperations[i].output_tensors[0]->index;
+-         input_op_2->addition_offset =
+-            0x80 - poperations[i].input_tensors[1]->zero_point;
+-         input_op_2->addition_scale = poperations[i].input_tensors[1]->scale;
+-         input_op_2->output_scale = poperations[i].output_tensors[0]->scale;
+-         input_op_2->output_zero_point =
+-            poperations[i].output_tensors[0]->zero_point;
+-
+-         break;
++         const struct pipe_ml_operation *add = &poperations[i];
++         if (add->input_tensors[0]->is_float) {
++            if (!rkt_lower_float_aux(subgraph, add, &operation)) {
++               rkt_ml_subgraph_destroy(pdevice, &subgraph->base);
++               return NULL;
++            }
++            util_dynarray_append(&subgraph->operations, operation);
++            break;
++         }
++          {
++            lower_tensor_shape(&poperations[i], &operation);
++            operation.integer_add = true;
++            operation.add_tensor = poperations[i].input_tensors[1]->index;
++            operation.addition_offset = poperations[i].input_tensors[1]->zero_point + 128;
++            operation.addition_scale = poperations[i].input_tensors[1]->scale;
++            util_dynarray_append(&subgraph->operations, operation);
++            break;
++         }
+       }
+       default:
+          DBG("poperation->type %d\n", poperations[i].type);
+@@ -377,128 +758,249 @@
+       }
+    }
+ 
++   if (rkt_context(subgraph->context)->error) { rkt_ml_subgraph_destroy(pdevice,&subgraph->base); return NULL; }
++   if (subgraph->float_pipeline) {
++      util_dynarray_foreach (&subgraph->operations, struct rkt_operation, o)
++         o->reuse_weights_cbuf = true;
++   }
++
++   /* Only alias exact native DW FP16-C8 -> 1x1 FP16-C8 tile layouts.
++    * Resource references and kernel input/output fences remain authoritative. */
++   if (subgraph->float_pipeline) {
++      util_dynarray_foreach (&subgraph->operations,struct rkt_operation,c) {
++         struct rkt_operation *p=find_producer(subgraph,c->input_index);
++         if (c->reduce_spatial || !native_link_compatible(p,c)) continue;
++         pipe_resource_reference(&c->conv_input,p->conv_output);
++         c->conv_native_input=true;
++         DBG("NATIVE_LINK producer=%u consumer=%u bytes=%u\n",p->output_index,c->output_index,c->conv_input_bytes);
++      }
++       {
++         util_dynarray_foreach (&subgraph->operations,struct rkt_operation,p) {
++            if (!p->float_conv_f16 || !p->depthwise) continue;
++            bool used=false,all_native=true;
++            util_dynarray_foreach (&subgraph->operations,struct rkt_operation,c) {
++               if (c->input_index==p->output_index) {
++                  used=true;all_native &= c->conv_native_input;
++               }
++               if (c->add_tensor==(int)p->output_index) { used=true;all_native=false; }
++            }
++            p->conv_lazy_output=used && all_native;
++            if (p->conv_lazy_output) DBG("LAZY_NATIVE_OUTPUT tensor=%u\n",p->output_index);
++         }
++      }
++   }
++
++    {
++      util_dynarray_foreach(&subgraph->operations,struct rkt_operation,c) {
++         if(c->reduce_spatial || !c->fp16_global_input) continue;
++         for(unsigned side=0;side<(c->aux_binary ? 2 : 1);side++) {
++            struct rkt_operation *p=find_producer(subgraph,side ? c->add_tensor : c->input_index);
++            if(!p || !p->fp16_global_output || p->output_height!=c->input_height || p->output_width!=c->input_width || p->output_channels!=(c->float_aux==RKT_FLOAT_CONCAT && side ? c->aux_dims[1][3]:c->input_channels)) continue;
++            if(side) {pipe_resource_reference(&c->conv_side,p->conv_output);c->conv_native_side=true;}
++            else {pipe_resource_reference(&c->conv_input,p->conv_output);c->conv_native_input=true;}
++            DBG("SHARED_NATIVE producer=%u consumer=%u side=%u\n",p->output_index,c->output_index,side);
++         }
++      }
++      util_dynarray_foreach(&subgraph->operations,struct rkt_operation,p) {
++         if(!p->fp16_global_output) continue;
++         bool used=false,all=true;
++         util_dynarray_foreach(&subgraph->operations,struct rkt_operation,c) {
++            if(c->input_index==p->output_index) {used=true;all &= c->conv_native_input;}
++            if(c->add_tensor==(int)p->output_index) {used=true;all &= c->conv_native_side;}
++         }
++         p->conv_lazy_output=used && all;
++      }
++   }
++
++   /* Auxiliary C8 buffers without halo have one unambiguous surface
++    * stride. Alias only an exact logical shape and physical allocation;
++    * broadcast operands must continue through their packing path. */
++    {
++      util_dynarray_foreach(&subgraph->operations,struct rkt_operation,c) {
++         if(!c->float_aux || c->fp16_global_input) continue;
++         for(unsigned side=0;side<(c->aux_binary ? 2:1);side++) {
++            struct rkt_operation *p=find_producer(subgraph,side ? c->add_tensor:c->input_index);
++            if(!p || !p->float_aux || p->fp16_global_output || p->output_height!=c->input_height ||
++               p->output_width!=c->input_width || p->output_channels!=c->input_channels ||
++               p->conv_physical_oc!=c->conv_physical_ic || p->conv_output_bytes!=c->conv_input_bytes) continue;
++            if(c->aux_binary && (c->aux_dims[side][1]!=p->output_height ||
++               c->aux_dims[side][2]!=p->output_width || c->aux_dims[side][3]!=p->output_channels)) continue;
++            if(side) {pipe_resource_reference(&c->conv_side,p->conv_output);c->conv_native_side=true;}
++            else {pipe_resource_reference(&c->conv_input,p->conv_output);c->conv_native_input=true;}
++            DBG("AUX_SHARED producer=%u consumer=%u side=%u\n",p->output_index,c->output_index,side);
++         }
++      }
++      util_dynarray_foreach(&subgraph->operations,struct rkt_operation,p) {
++         if(!p->float_aux || p->fp16_global_output) continue;
++         bool used=false,all=true;
++         util_dynarray_foreach(&subgraph->operations,struct rkt_operation,c) {
++            if(c->input_index==p->output_index) {used=true;all &= c->conv_native_input;}
++            if(c->add_tensor==(int)p->output_index) {used=true;all &= c->conv_native_side;}
++         }
++         p->conv_lazy_output=used && all;
++      }
++   }
++
+    /* Create input and output tensors */
+    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+                           operation) {
++      if (operation->float_conv_f16 || operation->float_aux) {
++         if(operation->aux_binary) create_tensor(subgraph,operation->add_tensor,operation->aux_bytes[1]);
++         /* Logical graph tensors are NHWC FP32. Each convolution owns its
++          * packed tiles; checked native links may alias a producer output. */
++         create_tensor(subgraph, operation->input_index,
++                       operation->aux_binary ? operation->aux_bytes[0] : operation->input_height * operation->input_width * operation->input_channels * sizeof(float));
++         create_tensor(subgraph, operation->output_index,
++                       operation->output_height * operation->output_width * operation->output_channels * sizeof(float));
++         continue;
++      }
+       create_tensor(subgraph, operation->input_index,
+                     calc_raw_input_size(operation));
+ 
++      if (operation->integer_add)
++         create_tensor(subgraph, operation->add_tensor, calc_raw_input_size(operation));
++
++      if (operation->reshape) {
++         struct pipe_resource **tensors = util_dynarray_begin(&subgraph->tensors);
++         pipe_resource_reference(&tensors[operation->output_index], tensors[operation->input_index]);
++         continue;
++      }
+       if (rkt_get_tensor(subgraph, operation->output_index) == NULL) {
+          create_tensor(subgraph, operation->output_index,
+                        calc_raw_output_size(operation));
+       }
+    }
+ 
++   /* TFLite omits constants from per-inference inputs. Initialize their
++    * logical buffers once, including scalars/vectors used by broadcast ops. */
++   if (subgraph->float_pipeline) {
++      for (unsigned i=0;i<count;i++) {
++         const struct pipe_ml_operation *p=&poperations[i];
++         unsigned n=p->type==PIPE_ML_OPERATION_TYPE_ADD || p->type==PIPE_ML_OPERATION_TYPE_MUL || p->type==PIPE_ML_OPERATION_TYPE_SUBTRACT || p->type==PIPE_ML_OPERATION_TYPE_SQUARED_DIFFERENCE || p->type==PIPE_ML_OPERATION_TYPE_DIV ? 2 : 1;
++         for (unsigned j=0;j<n;j++) {
++            const struct pipe_tensor *t=p->input_tensors[j];
++            if (!t->data || !t->is_float || t->type_size!=4) continue;
++            struct pipe_resource *res=&rkt_get_tensor(subgraph,t->index)->base;
++            unsigned bytes=t->dims[0]*t->dims[1]*t->dims[2]*t->dims[3]*4;
++            if (!res || pipe_buffer_size(res)<bytes) { rkt_ml_subgraph_destroy(pdevice, &subgraph->base); return NULL; }
++            struct pipe_transfer *tr=NULL;
++            void *data=pipe_buffer_map(subgraph->context,res,PIPE_MAP_WRITE,&tr);
++            if (!data) { rkt_ml_subgraph_destroy(pdevice, &subgraph->base); return NULL; }
++            memcpy(data,t->data,bytes);pipe_buffer_unmap(subgraph->context,tr);
++         }
++      }
++   }
++
+    /* Compile */
+    util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+                           operation) {
+-      rkt_split_tasks(subgraph, operation);
++      if (operation->reshape)
++         continue;
++      if (operation->pad_copy) {
++         /* Constant border initialized once, never copied by CPU per frame. */
++         struct pipe_transfer *tr;
++         struct rkt_resource *out = rkt_get_tensor(subgraph, operation->output_index);
++         void *map = pipe_buffer_map(subgraph->context, &out->base, PIPE_MAP_WRITE, &tr);
++         if (!map) { rkt_ml_subgraph_destroy(pdevice,&subgraph->base); return NULL; }
++         memset(map, operation->output_zero_point - 128, out->bo_size);
++         pipe_buffer_unmap(subgraph->context, tr);
++         struct split_task task = {0};
++         task.output_width = operation->input_width;
++         task.output_offset = (operation->output_width + 1) * 16;
++         util_dynarray_append(&operation->tasks, task);
++      } else if (operation->integer_add || operation->logistic) {
++         struct split_task task = {0};
++         task.output_width = operation->output_width;
++         util_dynarray_append(&operation->tasks, task);
++      } else if (operation->pooling) {
++         unsigned slices = DIV_ROUND_UP(operation->output_width, 128);
++         operation->reuse_weights_cbuf = true;
++         if (slices > 1)
++            operation->pool_scratch = pipe_buffer_create(subgraph->context->screen, 0,
++               PIPE_USAGE_DEFAULT, calc_raw_output_size(operation));
++         for (unsigned slice = 0; slice < slices; slice++) {
++            struct split_task task = {0};
++            task.output_width = MIN2(128, operation->output_width - slice * 128);
++            task.output_offset = slice * 128 * 16;
++            task.input_offset = slice * 128 * operation->stride * 16;
++            task.num = slices > 1 ? 2 * slice : 0;
++            util_dynarray_append(&operation->tasks, task);
++            if (slices > 1) {
++               task.num++;
++               util_dynarray_append(&operation->tasks, task);
++            }
++         }
++      } else if (!operation->float_conv_f16 && !operation->float_aux)
++         rkt_split_tasks(subgraph, operation);
+       compile_operation(subgraph, operation);
++      if (rkt_context(subgraph->context)->error) {
++         rkt_ml_subgraph_destroy(pdevice, &subgraph->base); return NULL;
++      }
+    }
+ 
+    return &subgraph->base;
+ }
+ 
+-void
+-rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
+-                       struct pipe_ml_subgraph *psubgraph,
+-                       unsigned inputs_count, unsigned input_idxs[],
+-                       void *inputs[], bool is_signed[])
++static void append_unique_handle(struct util_dynarray *a, uint32_t handle)
++{
++   util_dynarray_foreach(a,uint32_t,h) if(*h==handle) return;
++   util_dynarray_append(a,handle);
++}
++
++static void
++submit_operations(struct pipe_context *pcontext, struct rkt_ml_subgraph *subgraph,
++                  struct rkt_operation *operations, unsigned count)
+ {
+    struct rkt_screen *screen = rkt_screen(pcontext->screen);
+-   struct rkt_ml_subgraph *subgraph = (struct rkt_ml_subgraph *)(psubgraph);
+    int ret;
+-
+-   DBG("Processing input\n");
+-
+-   for (int i = 0; i < inputs_count; i++) {
+-      struct rkt_operation *operation =
+-         find_first_consumer(subgraph, input_idxs[i]);
+-      struct pipe_resource *input =
+-         &rkt_get_tensor(subgraph, input_idxs[i])->base;
+-      unsigned input_channels = operation->input_channels;
+-      unsigned output_channels = operation->output_channels;
+-
+-      struct rkt_resource *input_tensor =
+-         rkt_get_tensor(subgraph, operation->input_index);
+-      if (output_channels == 1 && input_channels == 1 &&
+-          !operation->addition_input && (operation->add_tensor == -1)) {
+-         pipe_buffer_copy(pcontext, &input_tensor->base, input, 0, 0,
+-                          pipe_buffer_size(input));
+-      } else {
+-         unsigned input_width = operation->input_width;
+-         unsigned input_height = operation->input_height;
+-         unsigned zero_point = operation->input_zero_point;
+-         struct pipe_transfer *transfer_out;
+-         uint8_t(*input_in)[input_height][input_channels] = inputs[i];
+-         uint8_t *map = pipe_buffer_map(pcontext, &input_tensor->base,
+-                                        PIPE_MAP_WRITE, &transfer_out);
+-
+-         DBG("Converting data\n");
+-
+-         /*
+-          * From the NVDLA docs: "For int8, one element of data refers to an 8-bit
+-          * signed integer." But only when transposing do we seem to need to
+-          * convert to signed. The DMA unit seems to be able to convert from
+-          * unsigned to signed though.
+-          */
+-         if (input_channels == 1) {
+-            unsigned n = 0;
+-            for (int x = 0; x < input_width; x++) {
+-               for (int y = 0; y < MAX2(input_height, FEATURE_ATOMIC_SIZE); y++) {
+-                  if (y < input_height)
+-                     map[n++] = input_in[x][y][0];
+-                  else
+-                     map[n++] = zero_point;
+-               }
+-            }
+-         } else {
+-            unsigned n = 0;
+-            for (int u = 0; u < DIV_ROUND_UP(input_channels, FEATURE_ATOMIC_SIZE);
+-                 u++) {
+-               for (int x = 0; x < input_width; x++) {
+-                  for (int y = 0; y < input_height; y++) {
+-                     for (int c = 0; c < FEATURE_ATOMIC_SIZE; c++) {
+-                        unsigned input_channel = c + u * FEATURE_ATOMIC_SIZE;
+-                        if (input_channel < input_channels)
+-                           map[n++] = input_in[x][y][input_channel] - 0x80;
+-                        else
+-                           map[n++] = zero_point - 0x80;
+-                     }
+-                  }
+-               }
+-            }
+-         }
+-
+-         if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
+-            rkt_dump_buffer(map, "input", 0, 0, 0,
+-                            rkt_get_tensor(subgraph, input_idxs[i])->bo_size);
+-
+-         DBG("Converted data\n");
+-
+-         pipe_buffer_unmap(pcontext, transfer_out);
+-      }
+-   }
+-   DBG("Processed input\n");
+-
+    DBG("Submitting graph\n");
+ 
+    struct util_dynarray jobs = UTIL_DYNARRAY_INIT;
+-
+-   util_dynarray_foreach (&subgraph->operations, struct rkt_operation,
+-                          operation) {
+-      unsigned num_inputs = operation->add_tensor != -1 ? 2 : 1;
++   /* These arrays are shared by the split tasks of one operation. */
++   struct util_dynarray handle_arrays = UTIL_DYNARRAY_INIT;
++
++   for (unsigned n = 0; n < count; n++) {
++      struct rkt_operation *operation = &operations[n];
++      if (operation->reshape) continue;
++      unsigned num_inputs = operation->float_aux ? (2+!!operation->conv_prelu+!!operation->conv_side+!!operation->aux_scratch) : operation->float_conv_f16 ? (operation->conv_prelu ? 5 : 4) : (operation->add_tensor != -1 ? 2 : 1);
+       uint32_t *in_bo_handles = calloc(num_inputs, sizeof(uint32_t));
+       uint32_t *out_bo_handles = malloc(sizeof(uint32_t));
+-
+-      in_bo_handles[0] = rkt_get_tensor(subgraph, operation->input_index)->handle;
+-
+-      if (operation->add_tensor != -1)
++      util_dynarray_append(&handle_arrays, in_bo_handles);
++      util_dynarray_append(&handle_arrays, out_bo_handles);
++
++      in_bo_handles[0] = (operation->float_conv_f16 || operation->float_aux) ? rkt_resource(operation->conv_input)->handle : rkt_get_tensor(subgraph, operation->input_index)->handle;
++      if (operation->float_conv_f16) {
++         /* Retain every DMA source, including coefficients and commands, until
++          * the asynchronous job releases its last reference. */
++         in_bo_handles[1] = rkt_resource(operation->weights)->handle;
++         in_bo_handles[2] = rkt_resource(operation->biases)->handle;
++         in_bo_handles[3] = rkt_resource(operation->regcmd)->handle;
++         if(operation->conv_prelu) in_bo_handles[4]=rkt_resource(operation->conv_prelu)->handle;
++      }
++
++      if (operation->float_aux) {
++         in_bo_handles[1]=rkt_resource(operation->regcmd)->handle;
++         unsigned j=2;
++         if(operation->conv_prelu) in_bo_handles[j++]=rkt_resource(operation->conv_prelu)->handle;
++         if(operation->conv_side) in_bo_handles[j++]=rkt_resource(operation->conv_side)->handle;
++         if(operation->aux_scratch) in_bo_handles[j++]=rkt_resource(operation->aux_scratch)->handle;
++      }
++      if (operation->add_tensor != -1 && !operation->float_aux)
+          in_bo_handles[1] =
+             rkt_get_tensor(subgraph, operation->add_tensor)->handle;
+ 
++      /* Shared main/EW operands may name the same GEM object. Submit each
++       * input reservation only once; the command still keeps both addresses. */
++      unsigned unique_inputs=0;
++      for(unsigned i=0;i<num_inputs;i++) {
++         bool found=false;
++         for(unsigned j=0;j<unique_inputs;j++) found |= in_bo_handles[j]==in_bo_handles[i];
++         if(!found) in_bo_handles[unique_inputs++]=in_bo_handles[i];
++      }
++      num_inputs=unique_inputs;
++
+       out_bo_handles[0] =
+-         rkt_get_tensor(subgraph, operation->output_index)->handle;
++         (operation->float_conv_f16 || operation->float_aux) ? rkt_resource(operation->conv_output)->handle : rkt_get_tensor(subgraph, operation->output_index)->handle;
+ 
+       if (operation->reuse_weights_cbuf) {
+          /* Submit all tasks to the same core, so weights can be reused */
+@@ -545,17 +1047,249 @@
+    submit.jobs = (uint64_t)util_dynarray_begin(&jobs);
+    submit.job_count = util_dynarray_num_elements(&jobs, struct drm_rocket_job);
+ 
+-   ret = drmIoctl(screen->fd, DRM_IOCTL_ROCKET_SUBMIT, &submit);
+-   assert(ret == 0);
++   struct util_dynarray merged_tasks=UTIL_DYNARRAY_INIT;
++   struct util_dynarray merged_in=UTIL_DYNARRAY_INIT,merged_out=UTIL_DYNARRAY_INIT;
++   struct drm_rocket_job merged={0};
++   if(subgraph->float_pipeline && count>1) {
++      /* Preserve task order on one core and retain every DMA object. Outputs
++       * also cover implicit dependencies when a handle is read and written;
++       * never reserve the same object in both handle lists. */
++      util_dynarray_foreach(&jobs,struct drm_rocket_job,j) {
++         struct drm_rocket_task *t=(void *)(uintptr_t)j->tasks;
++         for(unsigned i=0;i<j->task_count;i++) util_dynarray_append(&merged_tasks,t[i]);
++         uint32_t *handles=(void *)(uintptr_t)j->out_bo_handles;
++         for(unsigned i=0;i<j->out_bo_handle_count;i++) append_unique_handle(&merged_out,handles[i]);
++      }
++      util_dynarray_foreach(&jobs,struct drm_rocket_job,j) {
++         uint32_t *handles=(void *)(uintptr_t)j->in_bo_handles;
++         for(unsigned i=0;i<j->in_bo_handle_count;i++) {
++            bool output=false;
++            util_dynarray_foreach(&merged_out,uint32_t,h) output |= *h==handles[i];
++            if(!output) append_unique_handle(&merged_in,handles[i]);
++         }
++      }
++      merged.task_struct_size=sizeof(struct drm_rocket_task);
++      merged.tasks=(uint64_t)(uintptr_t)util_dynarray_begin(&merged_tasks);
++      merged.task_count=util_dynarray_num_elements(&merged_tasks,struct drm_rocket_task);
++      merged.in_bo_handles=(uint64_t)(uintptr_t)util_dynarray_begin(&merged_in);
++      merged.in_bo_handle_count=util_dynarray_num_elements(&merged_in,uint32_t);
++      merged.out_bo_handles=(uint64_t)(uintptr_t)util_dynarray_begin(&merged_out);
++      merged.out_bo_handle_count=util_dynarray_num_elements(&merged_out,uint32_t);
++      submit.jobs=(uint64_t)(uintptr_t)&merged;submit.job_count=merged.task_count ? 1:0;
++      if(getenv("ROCKET_PROFILE")) fprintf(stderr,"PROFILE_BATCH ops=%u tasks=%u in=%u out=%u\n",count,merged.task_count,merged.in_bo_handle_count,merged.out_bo_handle_count);
++   }
++   ret = submit.job_count ? drmIoctl(screen->fd, DRM_IOCTL_ROCKET_SUBMIT, &submit) : 0;
++   if (ret) { rkt_context(pcontext)->error=errno ? errno : EIO; perror("DRM_IOCTL_ROCKET_SUBMIT"); }
++   util_dynarray_fini(&merged_tasks);util_dynarray_fini(&merged_in);util_dynarray_fini(&merged_out);
+ 
+    util_dynarray_foreach (&jobs, struct drm_rocket_job, job) {
+-      free((void *)job->in_bo_handles);
+-      free((void *)job->out_bo_handles);
+       free((void *)job->tasks);
+    }
+    util_dynarray_fini(&jobs);
++   util_dynarray_foreach (&handle_arrays, uint32_t *, handles)
++      free(*handles);
++   util_dynarray_fini(&handle_arrays);
+ 
+    DBG("Submitted graph\n");
++}
++
++static bool
++ml_failed(struct pipe_context *ctx, struct rkt_ml_subgraph *s)
++{
++   util_dynarray_foreach(&s->operations,struct rkt_operation,o)
++      if (o->error) rkt_context(s->context)->error = o->error;
++   int error=rkt_context(ctx)->error ? rkt_context(ctx)->error : rkt_context(s->context)->error;
++   rkt_context(ctx)->error=error;
++   rkt_context(s->context)->error=error;
++   return error != 0;
++}
++
++/* Correctness-first bridge: only format conversion/copies occur on the host.
++ * READ maps wait for the producer fence before unpacking or repacking. Keep
++ * logical buffers distinct from private DMA layouts, including fan-out/ADD.
++ */
++static void
++invoke_float_pipeline(struct pipe_context *ctx, struct rkt_ml_subgraph *s,
++                      unsigned count, unsigned indices[], void *inputs[])
++{
++   bool profile = getenv("ROCKET_PROFILE") != NULL;
++   uint64_t start = rkt_profile_ns();
++   for (unsigned i = 0; i < count; i++) {
++      struct pipe_resource *r = &rkt_get_tensor(s, indices[i])->base;
++      struct pipe_transfer *tr = NULL;
++      void *map = pipe_buffer_map(ctx, r, PIPE_MAP_WRITE, &tr);
++      if (!map) return;
++      struct rkt_operation *consumer = find_first_consumer(s, indices[i]);
++      unsigned bytes = consumer->aux_binary ? consumer->aux_bytes[consumer->input_index==indices[i] ? 0 : 1] : consumer->input_height * consumer->input_width * consumer->input_channels * sizeof(float);
++      memset(map, 0, pipe_buffer_size(r)); memcpy(map, inputs[i], bytes);
++      pipe_buffer_unmap(ctx, tr);
++   }
++   if (profile) fprintf(stderr, "PROFILE_INPUT ns=%lu\n", rkt_profile_ns()-start);
++   bool batch=true;
++   struct rkt_operation *pending=NULL;unsigned pending_count=0;
++   util_dynarray_foreach (&s->operations, struct rkt_operation, o) {
++      if(ml_failed(ctx,s)) return;
++      uint64_t t[6]; t[0]=rkt_profile_ns();
++      /* Host reads cannot pass unsubmitted producers. Every pending producer
++       * is lazy/native; flush before touching any dynamic logical operand. */
++      bool host_read=o->float_aux==RKT_FLOAT_SQRT || o->float_aux==RKT_FLOAT_RSQRT || o->float_aux==RKT_FLOAT_DIV || !o->conv_native_input || (o->conv_side && !o->conv_native_side && !o->aux_side_constant);
++      if(pending_count && host_read) {submit_operations(ctx,s,pending,pending_count);pending=NULL;pending_count=0;if(ml_failed(ctx,s))return;}
++      if(o->float_aux) {
++         struct pipe_transfer *tr=NULL;const float *input=NULL;
++         if(!o->conv_native_input) {input=pipe_buffer_map(ctx,&rkt_get_tensor(s,o->input_index)->base,PIPE_MAP_READ,&tr);if(!input) return;}
++         rkt_upload_float_aux(s,o,input);if(tr) pipe_buffer_unmap(ctx,tr);
++      } else if (o->conv_native_input) {
++         memset(o->profile,0,sizeof(o->profile));
++         /* Previous output inspection may have made the buffer CPU-owned.
++          * Keep the full PREP/FINI DMA synchronization before device reuse,
++          * but never write/repack the shared buffer. */
++         struct pipe_transfer *tr=NULL;
++         
++         rkt_prepare_float_output(s,o);
++      } else if (o->float_conv_f16 || o->float_aux) {
++         struct pipe_transfer *tr = NULL;
++         const float *input = pipe_buffer_map(ctx, &rkt_get_tensor(s, o->input_index)->base, PIPE_MAP_READ, &tr);
++         if (!input) return;
++         if(o->float_aux) rkt_upload_float_aux(s,o,input); else rkt_upload_float_conv(s, o, input); pipe_buffer_unmap(ctx, tr);
++      }
++      if(ml_failed(ctx,s)) return;
++      if (!rkt_validate_float_domain(s,o)) { ml_failed(ctx,s); return; }
++      t[1]=rkt_profile_ns();
++      if(batch) {
++         if(!pending) pending=o;
++         pending_count++;
++         if(!o->conv_lazy_output || o->float_aux==RKT_FLOAT_SQUARED_DIFF || o->float_aux==RKT_FLOAT_DIV) {
++            submit_operations(ctx,s,pending,pending_count);pending=NULL;pending_count=0;
++         }
++      } else submit_operations(ctx, s, o, 1);
++      if(ml_failed(ctx,s)) return;
++      t[2]=rkt_profile_ns(); t[3]=t[4]=t[5]=t[2];
++      if ((o->float_conv_f16 || o->float_aux) && !(o->conv_lazy_output)) {
++         struct pipe_transfer *raw_tr = NULL, *logical_tr = NULL;
++         const uint8_t *raw = pipe_buffer_map(ctx, o->conv_output, PIPE_MAP_READ, &raw_tr);
++         if (!raw) return;
++         if (o->conv_lazy_output) {
++            t[3]=rkt_profile_ns();
++            rkt_check_float_guards(o,raw); t[4]=rkt_profile_ns();
++         } else {
++            float *out=pipe_buffer_map(ctx,&rkt_get_tensor(s,o->output_index)->base,PIPE_MAP_WRITE,&logical_tr);
++            if (!out) {pipe_buffer_unmap(ctx,raw_tr);return;} t[3]=rkt_profile_ns();
++            if(o->float_aux) rkt_read_float_aux(o,raw,out); else rkt_read_float_conv(o,raw,out); t[4]=rkt_profile_ns();
++            pipe_buffer_unmap(ctx,logical_tr);
++         }
++         pipe_buffer_unmap(ctx,raw_tr); t[5]=rkt_profile_ns();
++      }
++      if(o->float_aux==RKT_FLOAT_SQUARED_DIFF || o->float_aux==RKT_FLOAT_DIV) rkt_check_float_scratch(s,o);
++      if (profile) fprintf(stderr, "PROFILE_OP out=%u kind=%s tasks=%u prepare=%lu submit=%lu wait_map=%lu unpack=%lu finish=%lu in_map=%lu in_zero=%lu pack=%lu in_finish=%lu out_map=%lu out_zero_finish=%lu\n",
++         o->output_index, o->float_aux == RKT_FLOAT_ADD ? "add" : o->depthwise ? "dw" : "conv",
++         util_dynarray_num_elements(&o->tasks, struct split_task),t[1]-t[0],t[2]-t[1],t[3]-t[2],t[4]-t[3],t[5]-t[4],
++         o->profile[0],o->profile[1],o->profile[2],o->profile[3],o->profile[4],o->profile[5]);
++   }
++   if(pending_count) submit_operations(ctx,s,pending,pending_count);
++}
++
++void
++rkt_ml_subgraph_invoke(struct pipe_context *pcontext,
++                       struct pipe_ml_subgraph *psubgraph,
++                       unsigned inputs_count, unsigned input_idxs[],
++                       void *inputs[], bool is_signed[])
++{
++   struct rkt_ml_subgraph *subgraph = (struct rkt_ml_subgraph *)(psubgraph);
++
++   if (ml_failed(pcontext,subgraph)) return;
++   if (subgraph->float_pipeline) {
++      invoke_float_pipeline(pcontext, subgraph, inputs_count, input_idxs, inputs);
++      ml_failed(pcontext,subgraph);
++      return;
++   }
++
++   DBG("Processing input\n");
++
++   for (int i = 0; i < inputs_count; i++) {
++      struct rkt_operation *operation =
++         find_first_consumer(subgraph, input_idxs[i]);
++      unsigned input_channels = operation->input_channels;
++      struct rkt_resource *input_tensor =
++         rkt_get_tensor(subgraph, input_idxs[i]);
++      {
++         unsigned input_width = operation->input_width;
++         unsigned input_height = operation->input_height;
++         unsigned zero_point = operation->integer_add && input_idxs[i] == operation->add_tensor ?
++            operation->addition_offset : operation->input_zero_point;
++         struct pipe_transfer *transfer_out;
++         uint8_t(*input_in)[input_height][input_channels] = inputs[i];
++         uint8_t *map = pipe_buffer_map(pcontext, &input_tensor->base,
++                                        PIPE_MAP_WRITE, &transfer_out);
++
++         if(!map) {ml_failed(pcontext,subgraph);return;}
++         DBG("Converting data\n");
++
++         /*
++          * From the NVDLA docs: "For int8, one element of data refers to an 8-bit
++          * signed integer." But only when transposing do we seem to need to
++          * convert to signed. The DMA unit seems to be able to convert from
++          * unsigned to signed though.
++          */
++         if (input_channels == 1 &&
++             (operation->addition_input || operation->add_tensor != -1)) {
++            unsigned n = 0;
++            for (int x = 0; x < input_width; x++) {
++               for (int y = 0; y < MAX2(input_height, FEATURE_ATOMIC_SIZE); y++) {
++                  if (y < input_height)
++                     map[n++] = input_in[x][y][0] + (is_signed[i] ? 128 : 0);
++                  else
++                     map[n++] = zero_point;
++               }
++            }
++         } else if (input_channels == 3 && rkt_input_storage_channels(operation) == 16) {
++            /* The image upload was dominated by 16 scalar branches per RGB
++             * pixel. Store the same C16 atom using two unaligned-safe words. */
++            const uint8_t *src = inputs[i];
++            uint8_t *dst = map;
++            uint64_t pad = UINT64_C(0x0101010101010101) * (uint8_t)(zero_point - 128);
++            uint64_t upper = pad & UINT64_C(0xffffffffff000000);
++            uint32_t sign = is_signed[i] ? 0 : 0x808080;
++            for (unsigned pixel = 0; pixel < input_width * input_height; pixel++) {
++               uint64_t first = upper | (((uint32_t)src[0] | ((uint32_t)src[1] << 8) |
++                                            ((uint32_t)src[2] << 16)) ^ sign);
++               memcpy(dst, &first, sizeof(first));
++               memcpy(dst + 8, &pad, sizeof(pad));
++               src += 3;
++               dst += 16;
++            }
++         } else {
++            unsigned n = 0;
++            for (int u = 0; u < rkt_input_storage_channels(operation) / FEATURE_ATOMIC_SIZE;
++                 u++) {
++               for (int x = 0; x < input_width; x++) {
++                  for (int y = 0; y < input_height; y++) {
++                     for (int c = 0; c < FEATURE_ATOMIC_SIZE; c++) {
++                        unsigned input_channel = c + u * FEATURE_ATOMIC_SIZE;
++                        if (input_channel < input_channels)
++                           map[n++] = input_in[x][y][input_channel] -
++                                      (is_signed[i] ? 0 : 0x80);
++                        else
++                           map[n++] = zero_point - 0x80;
++                     }
++                  }
++               }
++            }
++         }
++
++         if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
++            rkt_dump_buffer(map, "input", input_idxs[i], 0, 0,
++                            rkt_get_tensor(subgraph, input_idxs[i])->bo_size);
++
++         DBG("Converted data\n");
++
++         pipe_buffer_unmap(pcontext, transfer_out);
++      }
++   }
++   DBG("Processed input\n");
++
++   submit_operations(pcontext, subgraph, util_dynarray_begin(&subgraph->operations),
++                     util_dynarray_num_elements(&subgraph->operations, struct rkt_operation));
++   ml_failed(pcontext,subgraph);
+ }
+ 
+ void
+@@ -567,11 +1301,23 @@
+ {
+    struct rkt_ml_subgraph *subgraph = (struct rkt_ml_subgraph *)(psubgraph);
+ 
++   if(ml_failed(pcontext,subgraph))return;
++   uint64_t profile_start = rkt_profile_ns();
+    DBG("Processing output\n");
+ 
+    for (int i = 0; i < outputs_count; i++) {
+ 
+       struct rkt_operation *operation = find_producer(subgraph, output_idxs[i]);
++      /* TFLite may export a linked intermediate (for example in a capture
++       * graph). Materialize it on demand, directly into the requested buffer. */
++      if (subgraph->float_pipeline && operation->conv_lazy_output) {
++         struct pipe_transfer *tr=NULL;
++         const uint8_t *raw=pipe_buffer_map(pcontext,operation->conv_output,PIPE_MAP_READ,&tr);
++         if (!raw) {ml_failed(pcontext,subgraph);return;}
++         if(operation->float_aux) rkt_read_float_aux(operation,raw,outputs[i]); else rkt_read_float_conv(operation,raw,outputs[i]);
++         pipe_buffer_unmap(pcontext,tr);
++         continue;
++      }
+       struct rkt_resource *output_tensor =
+          rkt_get_tensor(subgraph, output_idxs[i]);
+       struct pipe_transfer *transfer = NULL;
+@@ -583,7 +1329,15 @@
+       DBG("Before pipe_buffer_map\n");
+       raw_output = pipe_buffer_map(pcontext, &output_tensor->base, PIPE_MAP_READ,
+                                    &transfer);
++      if(!raw_output) {ml_failed(pcontext,subgraph);return;}
+       DBG("After pipe_buffer_map\n");
++
++      if (subgraph->float_pipeline) {
++         unsigned bytes = operation->output_height * operation->output_width * operation->output_channels * sizeof(float);
++         memcpy(outputs[i], raw_output, bytes);
++         pipe_buffer_unmap(pcontext, transfer);
++         continue;
++      }
+ 
+       DBG("Converting data\n");
+ 
+@@ -591,14 +1345,15 @@
+       output_out = (void *)outputs[i];
+ 
+       if (DBG_ENABLED(ROCKET_DBG_DUMP_BOS))
+-         rkt_dump_buffer(raw_output, "output", 0, 0, 0, output_tensor->bo_size);
++         rkt_dump_buffer(raw_output, "output", output_idxs[i], 0, 0, output_tensor->bo_size);
+ 
+       for (int oc = 0; oc < operation->output_channels; oc++) {
+          for (int x = 0; x < operation->output_width; x++) {
+             for (int y = 0; y < operation->output_height; y++) {
+                unsigned c = oc % FEATURE_ATOMIC_SIZE;
+                unsigned g = oc / FEATURE_ATOMIC_SIZE;
+-               output_out[y][x][oc] = output_in[g][y][x][c] + 0x80;
++               output_out[y][x][oc] = output_in[g][y][x][c] +
++                                      (is_signed[i] ? 0 : 0x80);
+             }
+          }
+       }
+@@ -608,16 +1363,39 @@
+       pipe_buffer_unmap(pcontext, transfer);
+    }
+ 
++   /* Diagnostic check after final graph outputs have completed. Keep this
++    * separate from timing: it maps all retained intermediate output buffers. */
++   if(DBG_ENABLED(ROCKET_DBG_DUMP_BOS)) {
++      unsigned checked=0;
++      util_dynarray_foreach(&subgraph->operations,struct rkt_operation,o) {
++         if(!o->fp16_global_output && !o->float_aux) continue;
++         struct pipe_transfer *tr=NULL;
++         const uint8_t *raw=pipe_buffer_map(pcontext,o->conv_output,PIPE_MAP_READ,&tr);
++         if(!raw) {ml_failed(pcontext,subgraph);return;}
++         unsigned end=pipe_buffer_size(o->conv_output);
++         for(unsigned k=end-FLOAT_GUARD;k<end;k++) if(raw[k]!=0xa5) {o->error=EIO; break;}
++         pipe_buffer_unmap(pcontext,tr);checked++;
++      }
++      DBG("SHARED_GUARDS checked=%u intact\n",checked);
++   }
++   if (getenv("ROCKET_PROFILE")) fprintf(stderr,"PROFILE_OUTPUT ns=%lu\n",rkt_profile_ns()-profile_start);
++   ml_failed(pcontext,subgraph);
+    DBG("Processed output\n");
+ }
+ 
+ static void
+ free_operation(struct rkt_operation *operation)
+ {
++   pipe_resource_reference(&operation->conv_side, NULL);
++   pipe_resource_reference(&operation->aux_scratch, NULL);
++   pipe_resource_reference(&operation->conv_prelu, NULL);
++   pipe_resource_reference(&operation->conv_input, NULL);
++   pipe_resource_reference(&operation->conv_output, NULL);
+    util_dynarray_fini(&operation->tasks);
+    pipe_resource_reference(&operation->regcmd, NULL);
+    pipe_resource_reference(&operation->weights, NULL);
+    pipe_resource_reference(&operation->biases, NULL);
++   pipe_resource_reference(&operation->pool_scratch, NULL);
+ }
+ 
+ void
+--- a/src/gallium/drivers/rocket/rkt_ml.h
++++ b/src/gallium/drivers/rocket/rkt_ml.h
+@@ -7,6 +7,11 @@
+ #define RKT_ML_H
+ 
+ #include <util/u_dynarray.h>
++#include <time.h>
++static inline uint64_t rkt_profile_ns(void) {
++   struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
++   return (uint64_t)t.tv_sec * 1000000000 + t.tv_nsec;
++}
+ 
+ #include "rkt_device.h"
+ 
+@@ -21,6 +26,7 @@
+ 
+ struct split_task {
+    unsigned num;
++   unsigned conv_x, conv_y, conv_c, conv_input_bytes, conv_output_bytes;
+ 
+    unsigned top_slice;
+    unsigned bottom_slice;
+@@ -72,12 +78,47 @@
+    uint32_t regcfg_addr;
+ };
+ 
++enum rkt_float_operation {
++   RKT_FLOAT_NONE = 0,
++   RKT_FLOAT_PRELU = 1,
++   RKT_FLOAT_MAX_POOL = 2,
++   RKT_FLOAT_PAD = 3,
++   RKT_FLOAT_SIGMOID = 4,
++   RKT_FLOAT_RESHAPE = 5,
++   RKT_FLOAT_ADD = 6,
++   RKT_FLOAT_MUL = 7,
++   RKT_FLOAT_SQRT = 8,
++   RKT_FLOAT_RSQRT = 9,
++   RKT_FLOAT_NEG = 10,
++   RKT_FLOAT_SUB = 11,
++   RKT_FLOAT_SQUARED_DIFF = 12,
++   RKT_FLOAT_DIV = 13,
++   RKT_FLOAT_RECIPROCAL = 14,
++   RKT_FLOAT_SLICE = 15,
++   RKT_FLOAT_CONCAT = 16,
++};
++
+ struct rkt_operation {
++   int error; /* Sticky integrity/domain error, propagated to TFLite. */
+    struct pipe_resource *regcmd;
+    struct pipe_resource *weights;
+    struct pipe_resource *biases;
+-
++   struct pipe_resource *pool_scratch;
++
++   bool pad_copy;
++   bool reshape;
++   bool logistic;
++   bool integer_add;
++   bool deconv;
++   bool pooling;
++   unsigned pool_width, pool_height, pool_stride_y;
+    bool depthwise;
++   bool per_axis;
++   bool relu;
++   unsigned bs_shift;
++   unsigned rounding_offset;
++   unsigned double_bn_mul, double_bn_shift, double_out_shift;
++   unsigned bn_vector_offset;
+    bool reuse_weights_cbuf;
+    unsigned truncate_bits;
+    unsigned padding_top;
+@@ -112,12 +153,33 @@
+    int add_tensor;
+ 
+    struct util_dynarray tasks; /* struct split_task */
++
++   struct pipe_resource *conv_input, *conv_output, *conv_prelu, *conv_side, *aux_scratch;
++   uint64_t profile[6];
++   bool fp16_output_initialized;
++   bool fp16_global, fp16_global_input, fp16_global_output;
++   bool float_conv_f16;
++   bool conv_native_input, conv_native_side, conv_lazy_output;
++   unsigned conv_tiles_y, conv_tiles_x;
++   unsigned conv_input_bytes, conv_output_bytes;
++   unsigned conv_physical_ic, conv_physical_oc;
++   bool conv_relu;
++   bool conv_output_f16;
++
++   unsigned aux_slice_x;
++   bool reduce_spatial;
++   bool aux_binary;
++   bool aux_side_constant, aux_side_initialized;
++   bool input_padding_initialized;
++   unsigned aux_dims[2][4], aux_bytes[2];
++   enum rkt_float_operation float_aux;
+ };
+ 
+ struct rkt_ml_subgraph {
+    struct pipe_ml_subgraph base;
+ 
+    struct pipe_context *context;
++   bool float_pipeline;
+    struct util_dynarray operations; /* rkt_operation */
+    struct util_dynarray tensors;    /* pipe_resource* */
+ };
+@@ -152,4 +214,18 @@
+ void rkt_dump_buffer(const uint8_t *ptr, char *name, int operation_nr,
+                      int suboperation_nr, int offset, unsigned size);
+ 
++static inline unsigned
++rkt_input_storage_channels(const struct rkt_operation *op)
++{
++   unsigned atom = op->depthwise ? 64 : FEATURE_ATOMIC_SIZE;
++   return ((op->input_channels + atom - 1) / atom) * atom;
++}
++
++static inline unsigned
++rkt_output_storage_channels(const struct rkt_operation *op)
++{
++   unsigned atom = op->depthwise ? 64 : FEATURE_ATOMIC_SIZE;
++   return ((op->output_channels + atom - 1) / atom) * atom;
++}
++
+ #endif /* RKT_ML_H */
+--- a/src/gallium/drivers/rocket/rkt_regcmd.c
++++ b/src/gallium/drivers/rocket/rkt_regcmd.c
+@@ -6,6 +6,7 @@
+ #include "rkt_regcmd.h"
+ #include "rkt_ml.h"
+ #include "rkt_registers.h"
++#include "rkt_float_ops.h"
+ 
+ static void
+ emit_raw(struct util_dynarray *regs, uint32_t target, uint32_t reg,
+@@ -57,6 +58,9 @@
+               CNA_CONV_CON1_ARGB_IN(8);
+    }
+ 
++   if (operation->deconv)
++      con1 |= CNA_CONV_CON1_DECONV(1);
++
+    if (operation->depthwise)
+       con1 |= CNA_CONV_CON1_CONV_MODE(3);
+ 
+@@ -74,7 +78,9 @@
+         CNA_CONV_CON2_FEATURE_GRAINS(
+            50 + task->stride_y + 1)); /* Magic: Seems to pass the most tests */
+    EMIT(REG_CNA_CONV_CON3, CNA_CONV_CON3_CONV_X_STRIDE(task->stride_x) |
+-                              CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y));
++                              CNA_CONV_CON3_CONV_Y_STRIDE(task->stride_y) |
++         (operation->deconv ? CNA_CONV_CON3_DECONV_X_STRIDE(1) |
++                              CNA_CONV_CON3_DECONV_Y_STRIDE(1) : 0));
+    EMIT(REG_CNA_DATA_SIZE0,
+         CNA_DATA_SIZE0_DATAIN_WIDTH(task->input_width) |
+            CNA_DATA_SIZE0_DATAIN_HEIGHT(task->input_height));
+@@ -184,8 +190,8 @@
+    if (operation->addition_input || operation->add_tensor != -1)
+       pad_con1 = 0xffffff80;
+ 
+-   if (operation->depthwise && task->input_zero_point == 0x8b)
+-      pad_con1 = 0x0b0b;
++   if (operation->depthwise)
++      pad_con1 = ((task->input_zero_point - 0x80) & 0xff) * 0x01010101u;
+ 
+    EMIT(REG_CNA_PAD_CON1, pad_con1);
+ 
+@@ -209,7 +215,9 @@
+       feat_mode_cfg |= DPU_FEATURE_MODE_CFG_CONV_MODE(3);
+ 
+    EMIT(REG_DPU_FEATURE_MODE_CFG, feat_mode_cfg);
+-   EMIT(REG_DPU_DATA_FORMAT, 0);
++   EMIT(REG_DPU_DATA_FORMAT, operation->per_axis ?
++        DPU_DATA_FORMAT_BS_MUL_SHIFT_VALUE_NEG(operation->bs_shift) |
++        DPU_DATA_FORMAT_BN_MUL_SHIFT_VALUE_NEG(operation->double_bn_shift) : 0);
+    EMIT(REG_DPU_OFFSET_PEND, 0);
+    EMIT(REG_DPU_DST_BASE_ADDR,
+         rkt_get_tensor(subgraph, operation->output_index)->phys_addr +
+@@ -225,10 +233,12 @@
+         DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL(task->output_channels_real - 1) |
+            DPU_DATA_CUBE_CHANNEL_CHANNEL(task->output_channels - 1));
+    EMIT(REG_DPU_BS_CFG, DPU_BS_CFG_BS_ALU_ALGO(2) | DPU_BS_CFG_BS_ALU_SRC(1) |
+-                           DPU_BS_CFG_BS_RELU_BYPASS(1) |
+-                           DPU_BS_CFG_BS_MUL_BYPASS(1));
++                           DPU_BS_CFG_BS_RELU_BYPASS(!operation->relu) |
++                           DPU_BS_CFG_BS_MUL_BYPASS(!operation->per_axis));
+    EMIT(REG_DPU_BS_ALU_CFG, 0);
+-   EMIT(REG_DPU_BS_MUL_CFG, 0);
++   EMIT(REG_DPU_BS_MUL_CFG, operation->per_axis ?
++        DPU_BS_MUL_CFG_BS_MUL_SRC(1) |
++        DPU_BS_MUL_CFG_BS_MUL_SHIFT_VALUE(operation->bs_shift) : 0);
+    EMIT(REG_DPU_BS_RELUX_CMP_VALUE, 0);
+ 
+    if (operation->depthwise) {
+@@ -248,11 +258,18 @@
+    EMIT(REG_DPU_WDMA_SIZE_1,
+         DPU_WDMA_SIZE_1_HEIGHT_WDMA(task->output_height - 1) |
+            DPU_WDMA_SIZE_1_WIDTH_WDMA(task->output_width - 1));
+-   EMIT(REG_DPU_BN_CFG,
++   EMIT(REG_DPU_BN_CFG, operation->double_bn_mul ?
++        DPU_BN_CFG_BN_RELU_BYPASS(1) | DPU_BN_CFG_BN_ALU_BYPASS(1) :
++        operation->rounding_offset ?
++        DPU_BN_CFG_BN_RELU_BYPASS(1) | DPU_BN_CFG_BN_MUL_BYPASS(1) |
++           DPU_BN_CFG_BN_ALU_ALGO(2) | DPU_BN_CFG_BN_ALU_SRC(1) :
+         DPU_BN_CFG_BN_RELU_BYPASS(1) | DPU_BN_CFG_BN_MUL_BYPASS(1) |
+            DPU_BN_CFG_BN_ALU_BYPASS(1) | DPU_BN_CFG_BN_BYPASS(1));
+    EMIT(REG_DPU_BN_ALU_CFG, 0);
+-   EMIT(REG_DPU_BN_MUL_CFG, 0);
++   EMIT(REG_DPU_BN_MUL_CFG, operation->double_bn_mul ?
++        (operation->bn_vector_offset ? DPU_BN_MUL_CFG_BN_MUL_SRC(1) :
++         DPU_BN_MUL_CFG_BN_MUL_OPERAND(operation->double_bn_mul)) |
++        DPU_BN_MUL_CFG_BN_MUL_SHIFT_VALUE(operation->double_bn_shift) : 0);
+    EMIT(REG_DPU_BN_RELUX_CMP_VALUE, 0);
+ 
+    if (operation->add_tensor != -1) {
+@@ -323,8 +340,11 @@
+       if (scale < 1 << 14)
+          scale |= 1 << 14;
+ 
+-      EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(scale));
+-      EMIT(REG_DPU_OUT_CVT_SHIFT, DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(shift - 1));
++      EMIT(REG_DPU_OUT_CVT_SCALE, DPU_OUT_CVT_SCALE_OUT_CVT_SCALE(operation->double_bn_mul ? 1 : scale));
++      EMIT(REG_DPU_OUT_CVT_SHIFT, operation->double_bn_mul ?
++           DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(operation->double_out_shift) |
++           DPU_OUT_CVT_SHIFT_CVT_ROUND(1) :
++           DPU_OUT_CVT_SHIFT_OUT_CVT_SHIFT(shift - 1));
+    }
+ 
+    EMIT(REG_DPU_EW_OP_VALUE_0, 0);
+@@ -364,11 +384,16 @@
+       EMIT(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, 0);
+    }
+ 
+-   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(1));
++   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, DPU_RDMA_RDMA_BRDMA_CFG_BRDMA_DATA_USE(operation->per_axis ? 7 : 1));
+    EMIT(REG_DPU_RDMA_RDMA_BS_BASE_ADDR,
+         rkt_resource(operation->biases)->phys_addr);
+-   EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 0);
+-   EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR, 0);
++   EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, operation->bn_vector_offset ?
++        DPU_RDMA_RDMA_NRDMA_CFG_NRDMA_DATA_USE(4) : operation->rounding_offset ?
++        DPU_RDMA_RDMA_NRDMA_CFG_NRDMA_DATA_USE(1) : 0);
++   EMIT(REG_DPU_RDMA_RDMA_BN_BASE_ADDR, operation->bn_vector_offset ?
++        rkt_resource(operation->biases)->phys_addr + operation->bn_vector_offset :
++        operation->rounding_offset ?
++        rkt_resource(operation->biases)->phys_addr + operation->rounding_offset : 0);
+ 
+    unsigned ew_stride =
+       MAX2(operation->output_width * operation->output_height, 12);
+@@ -449,14 +474,181 @@
+             PC_OPERATION_ENABLE_RESERVED_0(14) | PC_OPERATION_ENABLE_OP_EN(1));
+ }
+ 
++/* Standalone native INT8 max pool, canonical C16 cubes. Requires the
++ * temporary kernel's standalone_ppu completion mode. */
++static void
++fill_pool_regcmd(struct rkt_ml_subgraph *sg, const struct rkt_operation *op,
++                struct util_dynarray *regs, unsigned task_num)
++{
++   struct split_task *task = util_dynarray_element(&op->tasks, struct split_task, task_num);
++   unsigned iw = task->output_width * op->stride, ih = op->input_height;
++   unsigned ow = task->output_width, oh = op->output_height;
++   unsigned channels = op->input_channels;
++   EMIT(REG_PPU_S_POINTER, 0xe);
++   EMIT(REG_PPU_RDMA_RDMA_S_POINTER, 0xe);
++   EMIT(REG_PPU_DATA_CUBE_IN_WIDTH, iw - 1);
++   EMIT(REG_PPU_DATA_CUBE_IN_HEIGHT, ih - 1);
++   EMIT(REG_PPU_DATA_CUBE_IN_CHANNEL, channels - 1);
++   EMIT(REG_PPU_DATA_CUBE_OUT_WIDTH, ow - 1);
++   EMIT(REG_PPU_DATA_CUBE_OUT_HEIGHT, oh - 1);
++   EMIT(REG_PPU_DATA_CUBE_OUT_CHANNEL, channels - 1);
++   EMIT(REG_PPU_OPERATION_MODE_CFG, 0x11);
++   EMIT(REG_PPU_POOLING_KERNEL_CFG, (op->pool_width - 1) |
++        ((op->pool_height - 1) << 8) | ((op->stride - 1) << 16) |
++        ((op->pool_stride_y - 1) << 20));
++   EMIT(REG_PPU_RECIP_KERNEL_WIDTH, 0);
++   EMIT(REG_PPU_RECIP_KERNEL_HEIGHT, 0);
++   EMIT(REG_PPU_POOLING_PADDING_CFG, op->padding_left |
++        (op->padding_top << 4) | (op->padding_right << 8) | (op->padding_bottom << 12));
++   EMIT(REG_PPU_PADDING_VALUE_1_CFG, 0x7ff80);
++   EMIT(REG_PPU_PADDING_VALUE_2_CFG, 0);
++   EMIT(REG_PPU_DST_BASE_ADDR, (op->pool_scratch ? rkt_resource(op->pool_scratch)->phys_addr :
++        rkt_get_tensor(sg, op->output_index)->phys_addr));
++   EMIT(REG_PPU_DST_SURF_STRIDE, oh * ow * 16);
++   EMIT(REG_PPU_DATA_FORMAT, oh * ow * 16);
++   EMIT(REG_PPU_MISC_CTRL, 3);
++   EMIT(REG_PPU_RDMA_RDMA_CUBE_IN_WIDTH, iw - 1);
++   EMIT(REG_PPU_RDMA_RDMA_CUBE_IN_HEIGHT, ih - 1);
++   EMIT(REG_PPU_RDMA_RDMA_CUBE_IN_CHANNEL, channels - 1);
++   EMIT(REG_PPU_RDMA_RDMA_SRC_BASE_ADDR, rkt_get_tensor(sg, op->input_index)->phys_addr + task->input_offset);
++   EMIT(REG_PPU_RDMA_RDMA_SRC_LINE_STRIDE, op->input_width * 16);
++   EMIT(REG_PPU_RDMA_RDMA_SRC_SURF_STRIDE, ih * op->input_width * 16);
++   EMIT(REG_PPU_RDMA_RDMA_DATA_FORMAT, 1);
++   if (task_num + 1 < util_dynarray_num_elements(&op->tasks, struct split_task))
++      EMIT(REG_PC_BASE_ADDRESS, 0)
++   else
++      util_dynarray_append_typed(regs, uint64_t, 0);
++   EMIT(REG_PC_REGISTER_AMOUNTS, 0);
++   util_dynarray_append_typed(regs, uint64_t, 0x0041000000000000);
++   emit_raw(regs, 0x81, REG_PC_OPERATION_ENABLE, 0x60);
++}
++/* Integer DPU identity pass: join a packed PPU column tile into a C16 cube.
++ * Precision fields are INT8 throughout; BS, BN and EW arithmetic are bypassed. */
++static void
++fill_integer_dpu(struct rkt_ml_subgraph *sg, const struct rkt_operation *op,
++               struct util_dynarray *regs, unsigned task_num)
++{
++   struct split_task *task = util_dynarray_element(&op->tasks, struct split_task, task_num);
++   unsigned w = task->output_width, h = op->output_height, c = op->output_channels;
++   unsigned gap = op->output_width - w;
++   if (op->logistic || op->pad_copy) c = rkt_output_storage_channels(op);
++   if (op->pad_copy) h = op->input_height;
++   unsigned dst_surface = op->output_width * op->output_height * 16;
++   EMIT(REG_DPU_S_POINTER, 0xe);
++   EMIT(REG_DPU_RDMA_RDMA_S_POINTER, 0xe);
++   EMIT(REG_DPU_FEATURE_MODE_CFG, DPU_FEATURE_MODE_CFG_BURST_LEN(15) |
++        DPU_FEATURE_MODE_CFG_OUTPUT_MODE(2) | DPU_FEATURE_MODE_CFG_FLYING_MODE(1));
++   EMIT(REG_DPU_DATA_FORMAT, 0);
++   EMIT(REG_DPU_OFFSET_PEND, 0);
++   EMIT(REG_DPU_DST_BASE_ADDR, rkt_get_tensor(sg, op->output_index)->phys_addr + task->output_offset);
++   EMIT(REG_DPU_DST_SURF_STRIDE, dst_surface);
++   EMIT(REG_DPU_DATA_CUBE_WIDTH, w - 1);
++   EMIT(REG_DPU_DATA_CUBE_HEIGHT, h - 1);
++   EMIT(REG_DPU_DATA_CUBE_NOTCH_ADDR, gap | (gap << 16));
++   EMIT(REG_DPU_DATA_CUBE_CHANNEL, DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL(c - 1) |
++        DPU_DATA_CUBE_CHANNEL_CHANNEL(c - 1));
++   unsigned mul_a = op->integer_add ? lroundf(op->input_scale / op->output_scale * 32768) : 1;
++   unsigned mul_b = op->integer_add ? lroundf(op->addition_scale / op->output_scale * 32768) : 1;
++   EMIT(REG_DPU_BS_CFG, op->logistic ? DPU_BS_CFG_BS_ALU_ALGO(2) |
++        DPU_BS_CFG_BS_MUL_BYPASS(1) | DPU_BS_CFG_BS_RELU_BYPASS(1) : op->integer_add ? DPU_BS_CFG_BS_ALU_ALGO(2) |
++        DPU_BS_CFG_BS_RELU_BYPASS(1) : 0x53);
++   EMIT(REG_DPU_BS_ALU_CFG, op->logistic ? 128 : op->integer_add ? 128 - op->input_zero_point : 0);
++   EMIT(REG_DPU_BS_MUL_CFG, op->integer_add ? DPU_BS_MUL_CFG_BS_MUL_OPERAND(mul_a) : 0);
++   EMIT(REG_DPU_BS_OW_CFG, DPU_BS_OW_CFG_OD_BYPASS(1));
++   EMIT(REG_DPU_BS_OW_OP, 0);
++   EMIT(REG_DPU_WDMA_SIZE_0, c - 1);
++   EMIT(REG_DPU_WDMA_SIZE_1, DPU_WDMA_SIZE_1_WIDTH_WDMA(w - 1) |
++        DPU_WDMA_SIZE_1_HEIGHT_WDMA(h - 1));
++   EMIT(REG_DPU_BN_CFG, 0x53);
++   EMIT(REG_DPU_BN_ALU_CFG, 0);
++   EMIT(REG_DPU_BN_MUL_CFG, 0);
++   if (op->logistic) {
++      EMIT(REG_DPU_EW_CFG, DPU_EW_CFG_EW_RELU_BYPASS(1) |
++           DPU_EW_CFG_EW_OP_CVT_BYPASS(1) | DPU_EW_CFG_EW_OP_BYPASS(1));
++      for (unsigned table = 0; table < 2; table++) {
++         EMIT(REG_DPU_LUT_ACCESS_CFG, (1 << 17) | (table << 16));
++         for (unsigned i = 0; i <= 512; i++) {
++            unsigned value;
++            float x = ((float)i - op->input_zero_point) * op->input_scale;
++            value = CLAMP(lroundf(256 / (1 + expf(-x))), 0, 255) + 1;
++            EMIT(REG_DPU_LUT_ACCESS_DATA, value);
++         }
++      }
++      EMIT(REG_DPU_LUT_CFG, DPU_LUT_CFG_LUT_HYBRID_PRIORITY(1) |
++           DPU_LUT_CFG_LUT_OFLOW_PRIORITY(1) | DPU_LUT_CFG_LUT_LO_LE_MUX(2));
++      EMIT(REG_DPU_LUT_INFO, 0);
++      EMIT(REG_DPU_LUT_LE_START, 0);
++      EMIT(REG_DPU_LUT_LE_END, 512);
++      EMIT(REG_DPU_LUT_LO_START, 0);
++      EMIT(REG_DPU_LUT_LO_END, 512);
++      EMIT(REG_DPU_LUT_LE_SLOPE_SCALE, 0);
++      EMIT(REG_DPU_LUT_LE_SLOPE_SHIFT, 0);
++      EMIT(REG_DPU_LUT_LO_SLOPE_SCALE, 0);
++      EMIT(REG_DPU_LUT_LO_SLOPE_SHIFT, 0);
++   } else if (op->integer_add) {
++      EMIT(REG_DPU_EW_CFG, DPU_EW_CFG_EW_DATA_MODE(1) | DPU_EW_CFG_EDATA_SIZE(1) |
++           DPU_EW_CFG_EW_ALU_ALGO(2) | DPU_EW_CFG_EW_RELU_BYPASS(1) |
++           DPU_EW_CFG_EW_LUT_BYPASS(1) | DPU_EW_CFG_EW_OP_SRC(1));
++      /* EW offset is added after multiplication: measured with all INT8 pairs. */
++      EMIT(REG_DPU_EW_CVT_OFFSET_VALUE, (128 - op->addition_offset) * mul_b);
++      EMIT(REG_DPU_EW_CVT_SCALE_VALUE, mul_b);
++   } else {
++      EMIT(REG_DPU_EW_CFG, DPU_EW_CFG_EW_RELU_BYPASS(1) |
++           DPU_EW_CFG_EW_OP_CVT_BYPASS(1) | DPU_EW_CFG_EW_LUT_BYPASS(1) |
++           DPU_EW_CFG_EW_OP_BYPASS(1) | DPU_EW_CFG_EW_BYPASS(1));
++   }
++   EMIT(REG_DPU_OUT_CVT_OFFSET, op->logistic ? -129 : op->integer_add ? op->output_zero_point - 128 : 0);
++   EMIT(REG_DPU_OUT_CVT_SCALE, 1);
++   EMIT(REG_DPU_OUT_CVT_SHIFT, op->integer_add ? 15 : 0);
++   EMIT(REG_DPU_SURFACE_ADD, dst_surface);
++   emit_raw(regs, DPU | 1, 0x40c4, 0);
++   EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH, w - 1);
++   EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT, h - 1);
++   EMIT(REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL, c - 1);
++   EMIT(REG_DPU_RDMA_RDMA_SRC_BASE_ADDR, ((op->integer_add || op->logistic || op->pad_copy) ? rkt_get_tensor(sg, op->input_index)->phys_addr :
++        rkt_resource(op->pool_scratch)->phys_addr));
++   EMIT(REG_DPU_RDMA_RDMA_BRDMA_CFG, 1 /* BRDMA_DISABLE */);
++   EMIT(REG_DPU_RDMA_RDMA_NRDMA_CFG, 1 /* NRDMA_DISABLE */);
++   EMIT(REG_DPU_RDMA_RDMA_ERDMA_CFG, op->integer_add ?
++        DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE(1) | DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE(1) :
++        DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DISABLE(1));
++   EMIT(REG_DPU_RDMA_RDMA_EW_BASE_ADDR, op->integer_add ? rkt_get_tensor(sg, op->add_tensor)->phys_addr : 0);
++   EMIT(REG_DPU_RDMA_RDMA_EW_SURF_STRIDE, op->integer_add ? w * h * 16 : 0);
++   EMIT(REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG, DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN(15) |
++        DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE(1));
++   EMIT(REG_DPU_RDMA_RDMA_SRC_DMA_CFG, 0);
++   EMIT(REG_DPU_RDMA_RDMA_SURF_NOTCH, 0);
++   EMIT(REG_DPU_RDMA_RDMA_PAD_CFG, 0);
++   EMIT(REG_DPU_RDMA_RDMA_WEIGHT, 0x01010101);
++   EMIT(REG_DPU_RDMA_RDMA_EW_SURF_NOTCH, 0);
++   if (task_num + 1 < util_dynarray_num_elements(&op->tasks, struct split_task))
++      EMIT(REG_PC_BASE_ADDRESS, 0)
++   else
++      util_dynarray_append_typed(regs, uint64_t, 0);
++   EMIT(REG_PC_REGISTER_AMOUNTS, 0);
++   util_dynarray_append_typed(regs, uint64_t, 0x0041000000000000);
++   emit_raw(regs, 0x81, REG_PC_OPERATION_ENABLE, 0x18);
++}
++
+ void
+ rkt_fill_regcmd(struct rkt_ml_subgraph *subgraph,
+                 const struct rkt_operation *operation,
+                 struct util_dynarray *regs, unsigned task_num)
+ {
++   if(operation->float_aux) { rkt_fill_float_aux_regcmd(subgraph,operation,regs,task_num); return; }
++
+    /*
+     * TODO: We should only need to set all the registers on the regcmd for the first
+     * task in an operation, but for now set them all to be sure.
+     */
+-   fill_first_regcmd(subgraph, operation, regs, task_num);
++   if (operation->float_conv_f16) {
++      rkt_fill_float_conv_regcmd(subgraph, operation, regs, task_num);
++      return;
++   }
++   if (operation->pad_copy || operation->logistic || operation->integer_add || (operation->pooling && operation->pool_scratch && task_num % 2))
++      fill_integer_dpu(subgraph, operation, regs, task_num);
++   else if (operation->pooling)
++      fill_pool_regcmd(subgraph, operation, regs, task_num);
++   else
++      fill_first_regcmd(subgraph, operation, regs, task_num);
+ }
+--- a/src/gallium/drivers/rocket/rkt_task.c
++++ b/src/gallium/drivers/rocket/rkt_task.c
+@@ -12,7 +12,7 @@
+    unsigned bpe = sizeof(uint8_t);
+    unsigned atomics_per_entry = CBUF_ENTRY_SIZE / FEATURE_ATOMIC_SIZE;
+    unsigned total_c_atomics =
+-      DIV_ROUND_UP(operation->input_channels * bpe, FEATURE_ATOMIC_SIZE);
++      DIV_ROUND_UP(rkt_input_storage_channels(operation) * bpe, FEATURE_ATOMIC_SIZE);
+    unsigned last_c_atomics = total_c_atomics % atomics_per_entry;
+    unsigned int_c_entries =
+       (total_c_atomics / atomics_per_entry) * operation->input_width;
+@@ -38,7 +38,7 @@
+ {
+    unsigned bpe = sizeof(uint8_t);
+    unsigned bytes = operation->weights_width * operation->weights_height *
+-                    operation->input_channels * bpe;
++                    rkt_input_storage_channels(operation) * bpe;
+    unsigned entries;
+    unsigned banks;
+ 
+@@ -73,17 +73,23 @@
+       task->input_width *= 2;
+ 
+    task->input_height = operation->input_height;
+-   task->input_channels =
+-      align(MAX2(operation->input_channels, FEATURE_ATOMIC_SIZE),
+-            FEATURE_ATOMIC_SIZE);
+-   task->input_channels_real = operation->input_channels;
++   task->input_channels = rkt_input_storage_channels(operation);
++   task->input_channels_real = operation->depthwise ? task->input_channels :
++                               operation->input_channels;
++   /* A non-fused one-channel tensor shares the C16 signed layout produced by
++    * DPU with every other convolution. Pad weights with zero contribution;
++    * use aligned CNA DMA, not the compact unsigned image-input path. */
++   if (operation->input_channels == 1 && !operation->addition_input &&
++       operation->add_tensor == -1)
++      task->input_channels_real = FEATURE_ATOMIC_SIZE;
+    task->input_zero_point = operation->input_zero_point;
+    task->input_scale = operation->input_scale;
+ 
+    task->output_width = operation->output_width;
+    task->output_height = operation->output_height;
+ 
+-   task->output_channels_real = operation->output_channels;
++   task->output_channels_real = operation->depthwise ?
++      rkt_output_storage_channels(operation) : operation->output_channels;
+    task->output_channels = align(MAX2(operation->output_channels, 32), 32);
+    if (operation->depthwise) {
+       if (task->output_channels_real <= 32)
+--- a/src/gallium/include/pipe/p_state.h
++++ b/src/gallium/include/pipe/p_state.h
+@@ -1045,6 +1045,10 @@
+     */
+    bool is_signed;
+    uint8_t type_size;
++   /** True for floating-point tensors; size alone also matches unsigned integers. */
++   bool is_float;
++   /** Immutable model data, including folded constant dequantization. */
++   bool is_constant;
+ };
+ 
+ /**
+@@ -1073,6 +1077,12 @@
+    PIPE_ML_OPERATION_TYPE_QUANTIZE,
+    PIPE_ML_OPERATION_TYPE_MAXIMUM,
+    PIPE_ML_OPERATION_TYPE_MINIMUM,
++   PIPE_ML_OPERATION_TYPE_SQRT,
++   PIPE_ML_OPERATION_TYPE_RSQRT,
++   PIPE_ML_OPERATION_TYPE_NEG,
++   PIPE_ML_OPERATION_TYPE_DIV,
++   PIPE_ML_OPERATION_TYPE_SQUARED_DIFFERENCE,
++   PIPE_ML_OPERATION_TYPE_REDUCE,
+ };
+ 
+ enum pipe_ml_pooling_type {
+@@ -1152,6 +1162,7 @@
+          unsigned dilation_width_factor;
+          unsigned dilation_height_factor;
+       } conv;
++      struct { unsigned axis; bool mean; } reduce;
+       struct {
+ 
+          /**
