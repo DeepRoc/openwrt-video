@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mesa
 PKG_VERSION:=26.2.2
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.xz
 PKG_SOURCE_URL:=https://archive.mesa3d.org/
@@ -460,7 +460,7 @@ endef
 define Package/libteflon-rocket
 $(call Package/mesa/Default)
   TITLE+= TFLite delegate for Rockchip RKNPU (rocket)
-  DEPENDS+=+libdrm +libexpat @aarch64
+  DEPENDS+=+libdrm +libexpat +libtensorflowlite +kmod-drm-rocket @TARGET_rockchip @aarch64
   VARIANT:=teflon-rocket
   CONFLICTS:=libteflon-etnaviv
 endef
@@ -638,6 +638,21 @@ MESON_ARGS += \
 	-Ddraw-use-llvm=false
 endif
 
+# NPU delegates must not build or stage a second copy of the GL stack.
+ifneq ($(filter teflon-%,$(BUILD_VARIANT)),)
+MESON_ARGS += \
+	-Dplatforms= \
+	-Degl=disabled \
+	-Dgbm=disabled \
+	-Dgles1=disabled \
+	-Dgles2=disabled \
+	-Dopengl=false \
+	-Dmesa-clc=auto \
+	-Dprecomp-compiler=auto \
+	-Dgallium-va=disabled \
+	-Dvideo-codecs=
+endif
+
 ifeq ($(BUILD_VARIANT),teflon-rocket)
 MESON_ARGS += \
 	-Dgallium-drivers=rocket \
@@ -663,10 +678,12 @@ MESON_ARGS += \
 	-Dvulkan-drivers=
 endif
 
+ifeq ($(filter teflon-%,$(BUILD_VARIANT)),)
 ifneq ($(CONFIG_BUILD_PATENTED),)
 MESON_ARGS += -Dvideo-codecs=all
 else
 MESON_ARGS += -Dvideo-codecs=all_free
+endif
 endif
 
 TARGET_CFLAGS += -I$(MESON_BUILD_DIR)/src/broadcom/
@@ -729,11 +746,17 @@ endif
 
 
 define Build/Configure
-	$(call Build/Configure/LLVMMesa)
+	$(if $(filter teflon-%,$(BUILD_VARIANT)),,$(call Build/Configure/LLVMMesa))
 	$(call Py3Build/InstallBuildDepends)
 	$(call Build/Configure/Meson)
 endef
 
+ifneq ($(filter teflon-%,$(BUILD_VARIANT)),)
+define Build/InstallDev
+	$(INSTALL_DIR) $(1)/usr/lib
+	$(CP) $(PKG_INSTALL_DIR)/usr/lib/libteflon.so $(1)/usr/lib/
+endef
+else
 define Build/InstallDev
 	$(INSTALL_DIR) $(1)/usr/include
 	$(CP) $(PKG_INSTALL_DIR)/usr/include/* $(1)/usr/include
@@ -742,6 +765,7 @@ define Build/InstallDev
 	$(INSTALL_DIR) $(1)/usr/lib/pkgconfig
 	$(CP) $(PKG_INSTALL_DIR)/usr/lib/pkgconfig/*.pc $(1)/usr/lib/pkgconfig
 endef
+endif
 
 define Package/libmesa/install
 	$(INSTALL_DIR) $(1)/usr/lib

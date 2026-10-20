@@ -1,0 +1,28 @@
+Subject: [PATCH] teflon: require packaged TFLite 2.19 headers for Rocket
+
+Keep the C delegate ABI aligned with libtensorflowlite. Other backends
+retain the bundled header selection. No runtime symbol dependency is
+introduced by this header-only use of pkg-config.
+
+--- a/src/gallium/frontends/teflon/meson.build
++++ b/src/gallium/frontends/teflon/meson.build
+@@ -1,3 +1,11 @@
++# The Rocket path was validated against this external delegate ABI.
++# Put these includes before Mesa's bundled TensorFlow 2.13 headers.
++teflon_includes = [inc_include, inc_src, inc_util, inc_gallium, inc_gallium_aux]
++if with_gallium_rocket
++  tflite_c = dependency('tensorflow-lite-c', version : '=2.19.0')
++  teflon_includes = [include_directories(tflite_c.get_variable(pkgconfig : 'includedir'))] + teflon_includes
++endif
++
+ libtfl_files = files(
+     'tfl_device.c')
+ 
+@@ -6,6 +14,6 @@
+   [libtfl_files, sha1_h],
+   c_args : [  ],
+   gnu_symbol_visibility : 'hidden',
+-  include_directories : [ inc_include, inc_src, inc_util, inc_gallium, inc_gallium_aux ],
++  include_directories : teflon_includes,
+   dependencies : [ idep_mesautil ]
+ )
