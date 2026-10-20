@@ -1,0 +1,601 @@
+Subject: [PATCH] teflon: integrate extended Rocket operations and tensor support
+
+--- a/src/gallium/frontends/teflon/tfl_device.c
++++ b/src/gallium/frontends/teflon/tfl_device.c
+@@ -12,6 +12,13 @@
+ #include "util/u_inlines.h"
+ 
+ #include "tensorflow/lite/builtin_ops.h"
++static uint64_t
++profile_ns(void)
++{
++   struct timespec t;
++   clock_gettime(CLOCK_MONOTONIC, &t);
++   return (uint64_t)t.tv_sec * 1000000000 + t.tv_nsec;
++}
+ #include "tensorflow/lite/c/common.h"
+ #include "tensorflow/lite/core/c/builtin_op_data.h"
+ 
+@@ -47,7 +54,15 @@
+    struct pipe_ml_device *ml_dev;
+    struct pipe_tensor *tensors;
+    unsigned tensor_count;
++   const TfLiteIntArray *prepare_plan;
+ };
++
++/* The FP16 and extended operation paths are Rocket capabilities. */
++static bool
++uses_rocket(const struct teflon_delegate *delegate)
++{
++   return delegate->dev && !strcmp(delegate->dev->driver_name, "rocket");
++}
+ 
+ struct teflon_subgraph {
+    struct pipe_ml_subgraph *base;
+@@ -76,28 +91,46 @@
+ {
+    struct pipe_tensor *tensors = delegate->tensors;
+ 
++   for (int i = 0; i < node->inputs->size; i++)
++      if (node->inputs->data[i] < 0 || node->inputs->data[i] >= delegate->tensor_count)
++         return false;
++   for (int i = 0; i < node->outputs->size; i++)
++      if (node->outputs->data[i] < 0 || node->outputs->data[i] >= delegate->tensor_count)
++         return false;
+    operation->input_count = node->inputs->size;
+    operation->input_tensors = calloc(operation->input_count, sizeof(void *));
++   if (operation->input_count && !operation->input_tensors)
++      return false;
+    for (unsigned i = 0; i < node->inputs->size; i++)
+       operation->input_tensors[i] = &tensors[node->inputs->data[i]];
+ 
+    operation->output_count = node->outputs->size;
+    operation->output_tensors = calloc(operation->output_count, sizeof(void *));
++   if (operation->output_count && !operation->output_tensors)
++      return false;
+    for (unsigned i = 0; i < node->outputs->size; i++)
+       operation->output_tensors[i] = &tensors[node->outputs->data[i]];
+ 
+    switch (node_registration->builtin_code) {
++   case kTfLiteBuiltinPrelu:
++      if (!uses_rocket(delegate))
++         return false;
++      operation->type = PIPE_ML_OPERATION_TYPE_LEAKY_RELU;
++      return true;
+    case kTfLiteBuiltinConv2d:
+    case kTfLiteBuiltinDepthwiseConv2d: {
++      if (node->inputs->size != 3 || node->outputs->size != 1)
++         return false;
+       operation->type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
+       operation->conv.weight_tensor = &tensors[node->inputs->data[1]];
+       operation->conv.bias_tensor = &tensors[node->inputs->data[2]];
+       if (node_registration->builtin_code == kTfLiteBuiltinConv2d) {
+          TfLiteConvParams *params = (TfLiteConvParams *)node->builtin_data;
+ 
+-         assert(params->activation == kTfLiteActNone ||
+-                params->activation == kTfLiteActRelu ||
+-                params->activation == kTfLiteActRelu6);
++         if (params->activation != kTfLiteActNone &&
++             params->activation != kTfLiteActRelu &&
++             params->activation != kTfLiteActRelu6)
++            return false;
+          if (node_registration->version >= 2) {
+             operation->conv.dilation_width_factor = params->dilation_width_factor;
+             operation->conv.dilation_height_factor = params->dilation_height_factor;
+@@ -127,9 +160,10 @@
+       } else {
+          TfLiteDepthwiseConvParams *params = (TfLiteDepthwiseConvParams *)node->builtin_data;
+ 
+-         assert(params->activation == kTfLiteActNone ||
+-                params->activation == kTfLiteActRelu ||
+-                params->activation == kTfLiteActRelu6);
++         if (params->activation != kTfLiteActNone &&
++             params->activation != kTfLiteActRelu &&
++             params->activation != kTfLiteActRelu6)
++            return false;
+          if (node_registration->version >= 2) {
+             operation->conv.dilation_width_factor = params->dilation_width_factor;
+             operation->conv.dilation_height_factor = params->dilation_height_factor;
+@@ -165,6 +199,8 @@
+       __attribute__((fallthrough));
+    case kTfLiteBuiltinAveragePool2d: {
+       TfLitePoolParams *params = node->builtin_data;
++      if (params->activation != kTfLiteActNone)
++         return false;
+ 
+       operation->type = PIPE_ML_OPERATION_TYPE_POOLING;
+ 
+@@ -188,7 +224,31 @@
+    case kTfLiteBuiltinMinimum:
+       operation->type = PIPE_ML_OPERATION_TYPE_MINIMUM;
+       break;
++   case kTfLiteBuiltinSub:
++      if (((TfLiteSubParams *)node->builtin_data)->activation != kTfLiteActNone)
++         return false;
++      operation->type = PIPE_ML_OPERATION_TYPE_SUBTRACT;
++      break;
++   case kTfLiteBuiltinSquaredDifference:
++      operation->type = PIPE_ML_OPERATION_TYPE_SQUARED_DIFFERENCE;
++      break;
++   case kTfLiteBuiltinDiv:
++      if (((TfLiteDivParams *)node->builtin_data)->activation != kTfLiteActNone)
++         return false;
++      operation->type = PIPE_ML_OPERATION_TYPE_DIV;
++      break;
++   case kTfLiteBuiltinNeg:
++      operation->type = PIPE_ML_OPERATION_TYPE_NEG;
++      break;
++   case kTfLiteBuiltinSqrt:
++      operation->type = PIPE_ML_OPERATION_TYPE_SQRT;
++      break;
++   case kTfLiteBuiltinRsqrt:
++      operation->type = PIPE_ML_OPERATION_TYPE_RSQRT;
++      break;
+    case kTfLiteBuiltinMul:
++      if (((TfLiteMulParams *)node->builtin_data)->activation != kTfLiteActNone)
++         return false;
+       operation->type = PIPE_ML_OPERATION_TYPE_MUL;
+       break;
+    case kTfLiteBuiltinAdd: {
+@@ -204,6 +264,15 @@
+ 
+       operation->type = PIPE_ML_OPERATION_TYPE_CONCATENATION;
+       operation->conc.axis = params->axis;
++      if (uses_rocket(delegate) && tf_context->tensors[node->inputs->data[0]].type == kTfLiteFloat32) {
++         int rank = tf_context->tensors[node->inputs->data[0]].dims->size;
++         if (rank < 1 || rank > 4 || params->activation != kTfLiteActNone)
++            return false;
++         int axis = params->axis < 0 ? params->axis + rank : params->axis;
++         if (axis < 0 || axis >= rank)
++            return false;
++         operation->conc.axis = axis + 4 - rank;
++      }
+       break;
+    }
+    case kTfLiteBuiltinSplit:
+@@ -236,6 +305,31 @@
+       break;
+    }
+    case kTfLiteBuiltinFullyConnected: {
++      if (uses_rocket(delegate) && tf_context->tensors[node->inputs->data[0]].type == kTfLiteFloat32) {
++         if (node->inputs->size != 3 || node->inputs->data[2] < 0)
++            return false;
++         const TfLiteFullyConnectedParams *params = node->builtin_data;
++         const TfLiteTensor *wt = &tf_context->tensors[node->inputs->data[1]];
++         struct pipe_tensor *in = operation->input_tensors[0], *out = operation->output_tensors[0], *w = &tensors[node->inputs->data[1]];
++         if (params->weights_format != kTfLiteFullyConnectedWeightsFormatDefault ||
++             (params->activation != kTfLiteActNone && params->activation != kTfLiteActRelu) || wt->dims->size != 2 ||
++             in->dims[0] != 1 || in->dims[1] != 1 || in->dims[2] != 1 || out->dims[0] != 1 || out->dims[1] != 1 || out->dims[2] != 1 ||
++             in->dims[3] != (unsigned)wt->dims->data[1] || out->dims[3] != (unsigned)wt->dims->data[0] || !w->data || !w->is_float || w->type_size != 4)
++            return false;
++         /* Only the delegate-private weight view changes: row-major [O,I]
++          * and [O,1,1,I] have identical element order. */
++         w->dims[0] = wt->dims->data[0];
++         w->dims[1] = 1;
++         w->dims[2] = 1;
++         w->dims[3] = wt->dims->data[1];
++         operation->type = PIPE_ML_OPERATION_TYPE_CONVOLUTION;
++         operation->conv.weight_tensor = w;
++         operation->conv.bias_tensor = &tensors[node->inputs->data[2]];
++         operation->conv.stride_x = operation->conv.stride_y = 1;
++         operation->conv.dilation_width_factor = operation->conv.dilation_height_factor = 1;
++         operation->conv.relu = params->activation == kTfLiteActRelu;
++         return true;
++      }
+       if (tf_context->tensors[node->inputs->data[0]].type != kTfLiteInt8 &&
+           tf_context->tensors[node->inputs->data[0]].type != kTfLiteUInt8)
+          return false;
+@@ -246,15 +340,16 @@
+       break;
+    }
+    case kTfLiteBuiltinReshape: {
+-      int32_t *shape = tf_context->tensors[node->inputs->data[1]].data.data;
+-
+       operation->type = PIPE_ML_OPERATION_TYPE_RESHAPE;
+-      memcpy(operation->reshape.shape, shape, 4 * sizeof(*operation->reshape.shape));
++      /* Use the normalized output shape; a shape tensor may have fewer than
++       * four elements, and reading four int32 values would overrun it. */
++      memcpy(operation->reshape.shape, operation->output_tensors[0]->dims,
++             sizeof(operation->reshape.shape));
+       break;
+    }
+    case kTfLiteBuiltinLeakyRelu: {
+       TfLiteLeakyReluParams *params = node->builtin_data;
+-   
++
+       operation->type = PIPE_ML_OPERATION_TYPE_LEAKY_RELU;
+       operation->leakyrelu.alpha = params->alpha;
+       break;
+@@ -274,9 +369,23 @@
+    case kTfLiteBuiltinHardSwish:
+       operation->type = PIPE_ML_OPERATION_TYPE_HSWISH;
+       break;
+-   case kTfLiteBuiltinSub:
+-      operation->type = PIPE_ML_OPERATION_TYPE_SUBTRACT;
+-      break;
++   case kTfLiteBuiltinMean:
++   case kTfLiteBuiltinSum: {
++      const TfLiteTensor *in = &tf_context->tensors[node->inputs->data[0]];
++      const TfLiteTensor *axis = &tf_context->tensors[node->inputs->data[1]];
++      const TfLiteReducerParams *params = node->builtin_data;
++      if (!params->keep_dims || axis->type != kTfLiteInt32 || axis->bytes != sizeof(int32_t) || !axis->data.data || in->dims->size < 1 || in->dims->size > 4)
++         return false;
++      int a = *(const int32_t *)axis->data.data;
++      if (a < 0)
++         a += in->dims->size;
++      if (a < 0 || a >= in->dims->size)
++         return false;
++      operation->type = PIPE_ML_OPERATION_TYPE_REDUCE;
++      operation->reduce.axis = a + 4 - in->dims->size;
++      operation->reduce.mean = node_registration->builtin_code == kTfLiteBuiltinMean;
++      break;
++   }
+    case kTfLiteBuiltinTranspose: {
+       int32_t *perm = tf_context->tensors[node->inputs->data[1]].data.data;
+ 
+@@ -285,18 +394,52 @@
+       break;
+    }
+    case kTfLiteBuiltinStridedSlice: {
+-      int *begin = tf_context->tensors[node->inputs->data[1]].data.data;
+-      int *end = tf_context->tensors[node->inputs->data[2]].data.data;
+-      int *strides = tf_context->tensors[node->inputs->data[3]].data.data;
+-
++      const TfLiteTensor *input = &tf_context->tensors[node->inputs->data[0]];
++      const TfLiteStridedSliceParams *params = node->builtin_data;
++      unsigned rank = input->dims->size;
++      if (rank < 1 || rank > 4 || params->ellipsis_mask || params->new_axis_mask)
++         return false;
++      for (unsigned j = 1; j <= 3; j++) {
++         const TfLiteTensor *t = &tf_context->tensors[node->inputs->data[j]];
++         if (t->type != kTfLiteInt32 || t->bytes != rank * sizeof(int32_t) || !t->data.data ||
++             (t->allocation_type != kTfLiteMmapRo && t->allocation_type != kTfLitePersistentRo))
++            return false;
++      }
++      const int *begin = tf_context->tensors[node->inputs->data[1]].data.data;
++      const int *end = tf_context->tensors[node->inputs->data[2]].data.data;
++      const int *strides = tf_context->tensors[node->inputs->data[3]].data.data;
+       operation->type = PIPE_ML_OPERATION_TYPE_STRIDED_SLICE;
+-      memcpy(operation->slice.begin, begin, sizeof(operation->slice.begin));
+-      memcpy(operation->slice.end, end, sizeof(operation->slice.end));
+-      memcpy(operation->slice.strides, strides, sizeof(operation->slice.strides));
+-
++      for (unsigned j = 0; j < 4; j++) {
++         operation->slice.begin[j] = 0;
++         operation->slice.end[j] = 1;
++         operation->slice.strides[j] = 1;
++      }
++      for (unsigned j = 0; j < rank; j++) {
++         int size = input->dims->data[j], a = (params->begin_mask & (1 << j)) ? 0 : begin[j], z = (params->end_mask & (1 << j)) ? size : end[j];
++         if (strides[j] != 1 || size <= 0)
++            return false;
++         if (a < 0)
++            a += size;
++         if (z < 0)
++            z += size;
++         a = CLAMP(a, 0, size);
++         z = CLAMP(z, 0, size);
++         if (params->shrink_axis_mask & (1 << j)) {
++            if (size != 1 || a != 0)
++               return false;
++            z = 1;
++         }
++         if (z <= a)
++            return false;
++         operation->slice.begin[j + 4 - rank] = a;
++         operation->slice.end[j + 4 - rank] = z;
++      }
+       break;
+    }
+    case kTfLiteBuiltinResizeNearestNeighbor: {
++      TfLiteResizeNearestNeighborParams *params = node->builtin_data;
++      if (params->align_corners || params->half_pixel_centers)
++         return false;
+       operation->type = PIPE_ML_OPERATION_TYPE_RESIZE;
+       break;
+    }
+@@ -394,7 +537,9 @@
+    }
+ 
+    tensor->type_size = tf_format_to_size(tf_tensor.type);
++   tensor->is_float = tf_tensor.type == kTfLiteFloat32 || tf_tensor.type == kTfLiteFloat64;
+    tensor->index = index;
++   tensor->is_constant = tf_tensor.allocation_type == kTfLiteMmapRo && tf_tensor.data.raw_const;
+    for (int out_dim = 0; out_dim < 4; out_dim++) {
+       int in_dim = tf_tensor.dims->size - 4 + out_dim;
+       if (in_dim >= 0)
+@@ -509,6 +654,24 @@
+       case PIPE_ML_OPERATION_TYPE_HSWISH:
+          teflon_debug("%-15s ", "HSWISH");
+          break;
++      case PIPE_ML_OPERATION_TYPE_SQRT:
++         teflon_debug("%-15s ", "SQRT");
++         break;
++      case PIPE_ML_OPERATION_TYPE_SQUARED_DIFFERENCE:
++         teflon_debug("%-15s ", "SQUARED_DIFF");
++         break;
++      case PIPE_ML_OPERATION_TYPE_DIV:
++         teflon_debug("%-15s ", "DIV");
++         break;
++      case PIPE_ML_OPERATION_TYPE_NEG:
++         teflon_debug("%-15s ", "NEG");
++         break;
++      case PIPE_ML_OPERATION_TYPE_RSQRT:
++         teflon_debug("%-15s ", "RSQRT");
++         break;
++      case PIPE_ML_OPERATION_TYPE_REDUCE:
++         teflon_debug("%-15s ", "REDUCE");
++         break;
+       case PIPE_ML_OPERATION_TYPE_SUBTRACT:
+          teflon_debug("%-15s ", "SUB");
+          break;
+@@ -557,7 +720,6 @@
+       teflon_debug("%-20s %-20s\n", input_buf, output_buf);
+       ralloc_free(input_buf);
+       ralloc_free(output_buf);
+-
+    }
+    teflon_debug("\n");
+ }
+@@ -593,17 +755,44 @@
+                                          &delegated_node_registration);
+ 
+       bool ret = fill_operation(delegate, tf_context, delegated_node, delegated_node_registration, &operations[i]);
+-      assert(ret);
++      if (!ret) {
++         for (int j = 0; j <= i; j++)
++            free_operation(&operations[j]);
++         tf_context->ReportError(tf_context, "Teflon: partition operation preparation failed");
++         return NULL;
++      }
+    }
+ 
+    if (debug_get_option_debug_teflon() & TEFLON_DEBUG_VERBOSE)
+       dump_graph(delegate->tensors, tf_context->tensors_size, operations, params->nodes_to_replace->size);
++
++   /* An exposed pre-activation output cannot be discarded by fusion. */
++   for (int i = 0; i < params->nodes_to_replace->size; i++) {
++      if (operations[i].type != PIPE_ML_OPERATION_TYPE_LEAKY_RELU)
++         continue;
++      for (int j = 0; j < params->output_tensors->size; j++) {
++         if (params->output_tensors->data[j] != operations[i].input_tensors[0]->index)
++            continue;
++         tf_context->ReportError(tf_context, "Teflon: PReLU fusion cannot export its input tensor");
++         for (int k = 0; k < params->nodes_to_replace->size; k++)
++            free_operation(&operations[k]);
++         return NULL;
++      }
++   }
+ 
+    struct pipe_ml_subgraph *subgraph;
+    subgraph = delegate->ml_dev->ml_subgraph_create(delegate->ml_dev,
+                                                    operations,
+                                                    params->nodes_to_replace->size);
+ 
++   for (int i = 0; i < params->nodes_to_replace->size; i++)
++      free_operation(&operations[i]);
++
++   if (!subgraph) {
++      tf_context->ReportError(tf_context, "Teflon: backend rejected delegate partition");
++      return NULL;
++   }
++
+    struct teflon_subgraph *tsubgraph = calloc(1, sizeof(*tsubgraph));
+    tsubgraph->base = subgraph;
+ 
+@@ -611,7 +800,7 @@
+    for (int i = 0; i < params->input_tensors->size; i++) {
+       unsigned tensor_idx = params->input_tensors->data[i];
+       TfLiteTensor *tensor = &tf_context->tensors[tensor_idx];
+-      if (tensor->allocation_type == kTfLiteMmapRo)
++      if (tensor->allocation_type == kTfLiteMmapRo || delegate->tensors[tensor_idx].data)
+          continue;
+       tsubgraph->input_tensors[tsubgraph->input_count] = tensor_idx;
+       tsubgraph->input_count++;
+@@ -629,16 +818,18 @@
+       teflon_debug("teflon: compiled graph, took %ld ms\n", (end - start));
+    }
+ 
+-   for (int i = 0; i < params->nodes_to_replace->size; i++) {
+-      free_operation(&operations[i]);
+-   }
+-
+    return tsubgraph;
+ }
+ 
+ static TfLiteStatus
+ partition_prepare(TfLiteContext *context, TfLiteNode *node)
+ {
++   struct teflon_subgraph *tsubgraph = (struct teflon_subgraph *)node->user_data;
++   if (!tsubgraph || !tsubgraph->base) {
++      context->ReportError(context, "Teflon: delegate partition was not created");
++      return kTfLiteDelegateError;
++   }
++
+    // TODO: If input size has changed, resize input, intermediate and output buffers
+ 
+    return kTfLiteOk;
+@@ -649,6 +840,9 @@
+ partition_free(TfLiteContext *tf_context, void *buffer)
+ {
+    struct teflon_subgraph *tsubgraph = (struct teflon_subgraph *)buffer;
++   if (!tsubgraph)
++      return;
++
+    struct pipe_ml_subgraph *subgraph = tsubgraph->base;
+ 
+    subgraph->device->ml_subgraph_destroy(subgraph->device, subgraph);
+@@ -660,8 +854,14 @@
+ static TfLiteStatus
+ partition_invoke(TfLiteContext *tf_context, TfLiteNode *node)
+ {
++   uint64_t profile_start = profile_ns();
+    struct teflon_delegate *delegate = (struct teflon_delegate *)node->delegate;
+    struct teflon_subgraph *tsubgraph = (struct teflon_subgraph *)node->user_data;
++   if (!tsubgraph || !tsubgraph->base) {
++      tf_context->ReportError(tf_context, "Teflon: delegate partition was not created");
++      return kTfLiteDelegateError;
++   }
++
+    struct pipe_ml_subgraph *subgraph = tsubgraph->base;
+    struct pipe_context *context = delegate->screen->context_create(delegate->screen, NULL, PIPE_CONTEXT_COMPUTE_ONLY);
+    long start = 0, end = 0;
+@@ -686,6 +886,11 @@
+    context->ml_subgraph_invoke(context, subgraph, tsubgraph->input_count, tsubgraph->input_tensors, buffers, is_signed);
+    free(buffers);
+    free(is_signed);
++   if (context->get_device_reset_status && context->get_device_reset_status(context) != PIPE_NO_RESET) {
++      tf_context->ReportError(tf_context, "Teflon: NPU execution failed; output is invalid");
++      context->destroy(context);
++      return kTfLiteDelegateError;
++   }
+ 
+    buffers = malloc(tsubgraph->output_count * sizeof(*buffers));
+    is_signed = malloc(tsubgraph->output_count * sizeof(*is_signed));
+@@ -701,6 +906,11 @@
+    context->ml_subgraph_read_output(context, subgraph, tsubgraph->output_count, tsubgraph->output_tensors, buffers, is_signed);
+    free(buffers);
+    free(is_signed);
++   if (context->get_device_reset_status && context->get_device_reset_status(context) != PIPE_NO_RESET) {
++      tf_context->ReportError(tf_context, "Teflon: NPU execution failed; output is invalid");
++      context->destroy(context);
++      return kTfLiteDelegateError;
++   }
+ 
+    if (unlikely(debug_get_option_debug_teflon() & TEFLON_DEBUG_VERBOSE)) {
+       struct timespec time;
+@@ -712,6 +922,8 @@
+    context->destroy(context);
+    context = NULL;
+ 
++   if (getenv("ROCKET_PROFILE"))
++      fprintf(stderr, "PROFILE_PARTITION ns=%lu\n", profile_ns() - profile_start);
+    return kTfLiteOk;
+ }
+ 
+@@ -755,6 +967,18 @@
+       return "FC";
+    case kTfLiteBuiltinMean:
+       return "MEAN";
++   case kTfLiteBuiltinSum:
++      return "SUM";
++   case kTfLiteBuiltinSqrt:
++      return "SQRT";
++   case kTfLiteBuiltinRsqrt:
++      return "RSQRT";
++   case kTfLiteBuiltinSquaredDifference:
++      return "SQUARED_DIFF";
++   case kTfLiteBuiltinDiv:
++      return "DIV";
++   case kTfLiteBuiltinNeg:
++      return "NEG";
+    case kTfLiteBuiltinStridedSlice:
+       return "STRIDED_SLICE";
+    case kTfLiteBuiltinResizeNearestNeighbor:
+@@ -854,8 +1078,10 @@
+    struct pipe_ml_operation operation = {0};
+    bool supported = false;
+ 
+-   if (!fill_operation(delegate, tf_context, node, registration, &operation))
++   if (!fill_operation(delegate, tf_context, node, registration, &operation)) {
++      free_operation(&operation);
+       return false;
++   }
+ 
+    supported = delegate->ml_dev->ml_operation_supported(delegate->ml_dev, &operation);
+ 
+@@ -871,12 +1097,86 @@
+    TfLiteIntArray *plan;
+    TfLiteNode *node;
+    TF_LITE_ENSURE_STATUS(tf_context->GetExecutionPlan(tf_context, &plan));
++   delegate->prepare_plan = plan;
+ 
+    delegate->tensors = calloc(tf_context->tensors_size, sizeof(*delegate->tensors));
++   if (!delegate->tensors)
++      return kTfLiteError;
+ 
+    for (int i = 0; i < tf_context->tensors_size; i++)
+       fill_tensor(delegate, tf_context, &delegate->tensors[i], i);
+    delegate->tensor_count = tf_context->tensors_size;
++
++   for (int j = 0; uses_rocket(delegate) && j < plan->size; j++) {
++      TfLiteNode *n;
++      TfLiteRegistration *reg;
++      TF_LITE_ENSURE_STATUS(tf_context->GetNodeAndRegistration(tf_context, plan->data[j], &n, &reg));
++      if (reg->builtin_code != kTfLiteBuiltinDequantize || n->inputs->size != 1 || n->outputs->size != 1)
++         continue;
++      unsigned a = n->inputs->data[0], b = n->outputs->data[0];
++      const TfLiteTensor *src = &tf_context->tensors[a], *dst = &tf_context->tensors[b];
++      if (src->type != kTfLiteFloat16 || dst->type != kTfLiteFloat32 || src->allocation_type != kTfLiteMmapRo || !src->data.raw_const || dst->bytes != src->bytes * 2)
++         continue;
++      float *data = malloc(dst->bytes);
++      if (!data)
++         return kTfLiteError;
++      const _Float16 *half = (const void *)src->data.raw_const;
++      for (size_t k = 0; k < src->bytes / 2; k++)
++         data[k] = (float)half[k];
++      free(delegate->tensors[b].data);
++      delegate->tensors[b].data = (void *)data;
++      delegate->tensors[b].is_constant = true;
++      teflon_debug("FOLD_FP16_CONSTANT node=%d tensor=%u elements=%zu\n", plan->data[j], b, src->bytes / 2);
++   }
++
++   /* Rocket hybrid-weight FP16 execution: dequantize static weights
++    * once in the delegate's private copy. Original TfLite tensors remain
++    * intact for CPU partitions. This deliberately omits dynamic activation
++    * quantization; compare against a separate float-weight CPU control. */
++   if (uses_rocket(delegate)) {
++      for (int j = 0; j < plan->size; j++) {
++         TfLiteNode *n;
++         TfLiteRegistration *reg;
++         TF_LITE_ENSURE_STATUS(tf_context->GetNodeAndRegistration(tf_context, plan->data[j], &n, &reg));
++         if (reg->builtin_code != kTfLiteBuiltinConv2d || n->inputs->size != 3)
++            continue;
++         unsigned id = n->inputs->data[1];
++         const TfLiteTensor *src = &tf_context->tensors[id];
++         if (tf_context->tensors[n->inputs->data[0]].type != kTfLiteFloat32 || src->type != kTfLiteInt8 ||
++             src->dims->size != 4 || src->allocation_type != kTfLiteMmapRo || !src->data.raw_const ||
++             src->quantization.type != kTfLiteAffineQuantization)
++            continue;
++         struct pipe_tensor *dst = &delegate->tensors[id];
++         if (dst->is_float)
++            continue;
++         const TfLiteAffineQuantization *q = src->quantization.params;
++         unsigned oc = src->dims->data[0];
++         if (!q || !q->scale || !q->zero_point || q->quantized_dimension != 0 ||
++             (q->scale->size != 1 && q->scale->size != (int)oc) ||
++             (q->zero_point->size != 1 && q->zero_point->size != (int)oc) || !oc || src->bytes % oc)
++            continue;
++         unsigned row = src->bytes / oc;
++         float *values = malloc(src->bytes * sizeof(float));
++         if (!values)
++            return kTfLiteError;
++         const int8_t *w = (const void *)src->data.raw_const;
++         for (unsigned c = 0; c < oc; c++)
++            for (unsigned k = 0; k < row; k++)
++               values[c * row + k] = (w[c * row + k] - q->zero_point->data[q->zero_point->size == 1 ? 0 : c]) * q->scale->data[q->scale->size == 1 ? 0 : c];
++         free(dst->data);
++         dst->data = (void *)values;
++         dst->type_size = 4;
++         dst->is_float = true;
++         dst->is_signed = false;
++         free(dst->scales);
++         dst->scales = NULL;
++         free(dst->zero_points);
++         dst->zero_points = NULL;
++         dst->scale = 1;
++         dst->zero_point = 0;
++         teflon_debug("HYBRID_FP16_WEIGHTS node=%d tensor=%u elements=%zu\n", plan->data[j], id, src->bytes);
++      }
++   }
+ 
+    teflon_debug("%3s %-15s %3s %-11s %s\n", "idx", "type", "ver", "support", "inputs");
+    teflon_debug("================================================================================================\n");
+@@ -952,6 +1252,7 @@
+       supported_nodes,
+       tf_delegate);
+ 
++   delegate->prepare_plan = NULL;
+    free(supported_nodes);
+ 
+    return status;
