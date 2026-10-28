@@ -36,7 +36,7 @@ endef
 MESON_ARGS += \
 	--wrap-mode=nofallback \
 	-Dbackend-drm=true \
-	-Dbackend-headless=false \
+	-Dbackend-headless=true \
 	-Dbackend-pipewire=false \
 	-Dbackend-rdp=false \
 	-Dbackend-vnc=false \
